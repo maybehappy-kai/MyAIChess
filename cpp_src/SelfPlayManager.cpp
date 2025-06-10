@@ -18,9 +18,30 @@
 std::mutex g_io_mutex;
 std::atomic<long long> g_request_id_counter(0);
 
+// 文件: cpp_src/SelfPlayManager.cpp
+
 void run_parallel_self_play(py::object job_queue, py::object result_queue, py::object final_data_queue, py::dict args) {
-    SelfPlayManager manager(job_queue, result_queue, final_data_queue, args);
-    manager.run();
+
+    // ==================== 从这里开始替换 ====================
+
+    // 1. 在GIL被持有时，安全地创建Manager对象。
+    // 使用智能指针，方便管理其生命周期。
+    auto manager = std::make_shared<SelfPlayManager>(job_queue, result_queue, final_data_queue, args);
+
+    // 2. 创建一个新的C++“管理线程”，它的唯一任务就是调用 manager->run()
+    std::thread cpp_manager_thread([manager]() {
+        manager->run();
+    });
+
+    // 3. Python主线程现在可以安全地释放GIL，并等待C++管理线程完成所有工作
+    {
+        py::gil_scoped_release release;
+        if (cpp_manager_thread.joinable()) {
+            cpp_manager_thread.join();
+        }
+    }
+
+    // ==================== 到这里替换结束 ====================
 }
 
 SelfPlayManager::SelfPlayManager(py::object job_queue, py::object result_queue, py::object final_data_queue, py::dict args)
@@ -59,7 +80,6 @@ void SelfPlayManager::run() {
 
     // 3. 等待所有worker线程完成它们的工作
     {
-        py::gil_scoped_release release_gil_while_waiting;
         for (auto& t : threads_) {
             if (t.joinable()) {
                 t.join();
@@ -107,31 +127,59 @@ void SelfPlayManager::worker_func(int worker_id) {
                             py::gil_scoped_acquire acquire;
                             job_queue_.attr("put")(py::make_tuple(request_id, py::cast(state)));
                         }
-                        while (true) {
-                            py::gil_scoped_acquire acquire_poll;
-                            try {
-                                py::tuple result = result_queue_.attr("get_nowait")();
-                                if (result[0].cast<long long>() == request_id) {
-                                    std::vector<float> policy;
-                                    py::list py_policy = result[1].cast<py::list>();
-                                    policy.reserve(py::len(py_policy));
-                                    for (py::handle item : py_policy) {
-                                        policy.push_back(item.cast<float>());
+                        bool inference_done = false;
+                        // 使用一个布尔标志来控制循环，而不是无限循环
+                        while (!inference_done) {
+                            { // 创建一个新的、独立的作用域，专门用于管理GIL
+
+                                // 1. 在进入作用域时，自动获取GIL
+                                py::gil_scoped_acquire acquire;
+
+                                try {
+                                    // 2. 所有与Python对象（队列）的交互都在这个受保护的作用域内进行
+                                    py::tuple result = result_queue_.attr("get_nowait")();
+
+                                    // 3. 检查返回的结果ID是否是当前线程正在等待的那个
+                                    if (result[0].cast<long long>() == request_id) {
+                                        // 如果ID匹配，处理结果
+
+                                        // 从Python的list安全地转换为C++的vector
+                                        std::vector<float> policy;
+                                        py::list py_policy = result[1].cast<py::list>();
+                                        policy.reserve(py::len(py_policy));
+                                        for (py::handle item : py_policy) {
+                                            policy.push_back(item.cast<float>());
+                                        }
+
+                                        // 获取value值
+                                        value = result[2].cast<double>();
+
+                                        // 使用获取到的策略来扩展MCTS节点
+                                        node->expand(policy);
+
+                                        // 标记任务完成，以便退出外层的while循环
+                                        inference_done = true;
+
+                                    } else {
+                                        // 如果ID不匹配，说明是其他线程的结果，把它放回队列
+                                        result_queue_.attr("put")(result);
                                     }
-                                    value = result[2].cast<double>();
-                                    node->expand(policy);
-                                    break;
-                                } else {
-                                    result_queue_.attr("put")(result);
+                                } catch (const py::error_already_set& e) {
+                                    // 如果捕获到异常，检查它是否是“队列为空”。
+                                    // 这是轮询中的正常情况，我们忽略它，稍后休眠。
+                                    if (!e.matches(queue_empty_exc_)) {
+                                        // 如果是其他未知异常，则打印出来方便调试
+                                         std::lock_guard<std::mutex> lock(g_io_mutex);
+                                         std::cerr << "[C++ Worker " << worker_id << "] Polling error: " << e.what() << std::endl;
+                                    }
                                 }
-                            } catch (const py::error_already_set& e) {
-                                if (!e.matches(queue_empty_exc_)) {
-                                     std::lock_guard<std::mutex> lock(g_io_mutex);
-                                     std::cerr << "[C++ Worker " << worker_id << "] Polling error: " << e.what() << std::endl;
-                                }
+
+                            } // 4. 当代码执行到这个右花括号时，`acquire`对象被销毁，GIL被自动、安全地释放
+
+                            // 5. 如果推理尚未完成，就在不持有GIL的情况下让线程休眠
+                            if (!inference_done) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                             }
-                            py::gil_scoped_release release_poll;
-                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
                         }
                     }
                     node->backpropagate(value);

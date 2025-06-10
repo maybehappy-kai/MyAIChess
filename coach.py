@@ -37,14 +37,38 @@ def inference_server_func(model, device, job_q, result_q, stop_event, batch_size
     model.eval()
     with torch.no_grad():
         while not stop_event.is_set():
+            # ==================== 从这里开始替换 ====================
+
             state_batch, id_batch = [], []
+
+            # 1. 阻塞式等待，直到获取到批次的第一个任务
+            try:
+                # 可以设置一个较长的超时，比如1秒。如果1秒都没有任务，可能就真的没事干了
+                req_id, state = job_q.get(timeout=1.0)
+                state_batch.append(state)
+                id_batch.append(req_id)
+            except queue.Empty:
+                # 如果长时间没有任务，则继续外层循环
+                continue
+
+            # 2. 第一个任务已收到，现在快速将队列中“已经存在”的其他任务也扫进批次
+            #    直到批次满，或者队列变空
             while len(id_batch) < batch_size:
                 try:
-                    req_id, state = job_q.get(timeout=0.01)
+                    # 使用get_nowait()或get(block=False)，它不会等待，队列为空则立即抛出异常
+                    req_id, state = job_q.get_nowait()
                     state_batch.append(state)
                     id_batch.append(req_id)
                 except queue.Empty:
+                    # 队列已空，说明我们已将所有积压的任务都收集了，可以跳出循环去处理批次
                     break
+
+            # ==================== 到这里替换结束 ====================
+
+            # 后续的代码保持不变
+            # if not state_batch: continue ...
+            # state_tensor = ...
+            # log_policies, values = model(state_tensor) ...
             if not state_batch:
                 continue
 
