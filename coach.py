@@ -1,4 +1,4 @@
-# file: coach.py (ABSOLUTE FINAL VERSION - Corrected Args)
+# file: coach.py (FINAL, BATCHED MCTS VERSION)
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -9,7 +9,6 @@ import tqdm
 import random
 import os
 import re
-import time
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from neural_net import ExtendedConnectNet
@@ -17,6 +16,7 @@ from config import args
 import cpp_mcts_engine
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def find_latest_model_file():
     path = "."
@@ -33,56 +33,41 @@ def find_latest_model_file():
     start_epoch = max_epoch + 1 if latest_file else 1
     return latest_file, start_epoch
 
-def inference_server_func(model, device, job_q, result_q, stop_event, batch_size, board_size):
+
+# ==================== 这是唯一需要修改的地方 ====================
+# 新的、为批处理MCTS优化的推理服务器
+def inference_server_func(model, device, job_q, result_q, stop_event, board_size):
     model.eval()
     with torch.no_grad():
         while not stop_event.is_set():
-            # ==================== 从这里开始替换 ====================
-
-            state_batch, id_batch = [], []
-
-            # 1. 阻塞式等待，直到获取到批次的第一个任务
             try:
-                # 可以设置一个较长的超时，比如1秒。如果1秒都没有任务，可能就真的没事干了
-                req_id, state = job_q.get(timeout=1.0)
-                state_batch.append(state)
-                id_batch.append(req_id)
+                # 1. 一次只获取一个“工作包”，这个包里包含了整个批次
+                #    设置一个超时，以便能定期检查 stop_event
+                request_id, state_batch = job_q.get(timeout=1.0)
+
+                # 2. state_batch 现在是一个状态列表，直接转换成numpy数组
+                state_tensor = torch.tensor(np.array(state_batch), device=device, dtype=torch.float32)
+
+                # 确保张量形状正确 (B, C, H, W)
+                state_tensor = state_tensor.view(-1, 6, board_size, board_size)
+
+                # 使用自动混合精度进行推理
+                with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+                    log_policies, values = model(state_tensor)
+
+                # 将torch张量转为Python列表，方便后续处理
+                # C++端将接收到 [[p1,p2...], [p1,p2...]] 和 [v1, v2...]
+                policies = torch.exp(log_policies).cpu().numpy().tolist()
+                values = values.squeeze(-1).cpu().numpy().tolist()
+
+                # 3. 将整个批次的结果打包后，一次性放回结果队列
+                result_q.put((request_id, policies, values))
+
             except queue.Empty:
-                # 如果长时间没有任务，则继续外层循环
+                # 队列为空是正常现象，继续循环，检查stop_event
                 continue
+# =============================================================
 
-            # 2. 第一个任务已收到，现在快速将队列中“已经存在”的其他任务也扫进批次
-            #    直到批次满，或者队列变空
-            while len(id_batch) < batch_size:
-                try:
-                    # 使用get_nowait()或get(block=False)，它不会等待，队列为空则立即抛出异常
-                    req_id, state = job_q.get_nowait()
-                    state_batch.append(state)
-                    id_batch.append(req_id)
-                except queue.Empty:
-                    # 队列已空，说明我们已将所有积压的任务都收集了，可以跳出循环去处理批次
-                    break
-
-            # ==================== 到这里替换结束 ====================
-
-            # 后续的代码保持不变
-            # if not state_batch: continue ...
-            # state_tensor = ...
-            # log_policies, values = model(state_tensor) ...
-            if not state_batch:
-                continue
-
-            state_tensor = torch.tensor(np.array(state_batch), device=device, dtype=torch.float32)
-            state_tensor = state_tensor.view(-1, 6, board_size, board_size)
-
-            with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-                log_policies, values = model(state_tensor)
-
-            policies = torch.exp(log_policies).cpu().numpy()
-            values = values.squeeze(-1).cpu().numpy()
-
-            for req_id, policy, value in zip(id_batch, policies, values):
-                result_q.put((req_id, policy.tolist(), float(value)))
 
 class Coach:
     def __init__(self, model, args):
@@ -116,24 +101,23 @@ class Coach:
         for i in range(start_epoch, start_epoch + self.args['num_iterations']):
             print(f"------ 迭代轮次: {i} ------")
             print("步骤1：启动C++引擎进行自我对弈 (此过程将阻塞，请耐心等待)...")
-            job_queue = queue.Queue(maxsize=self.args['batch_size'] * 2)
+            job_queue = queue.Queue() # maxsize不再需要，因为每次只放一个大的工作包
             result_queue = queue.Queue()
             final_data_queue = queue.Queue()
             stop_event = threading.Event()
+
+            # 注意：新的inference_server_func不再需要batch_size参数
             server_thread = threading.Thread(
                 target=inference_server_func,
-                args=(self.model, device, job_queue, result_queue, stop_event, self.args['batch_size'], self.args['board_size'])
+                args=(self.model, device, job_queue, result_queue, stop_event, self.args['board_size'])
             )
             server_thread.start()
 
-            # =================== 关键修正在这里 ===================
-            # 创建C++代码真正需要的参数字典
             cpp_args = {
-                'num_selfPlay_episodes': self.args['num_selfPlay_episodes'], # C++用这个来决定总任务数
-                'num_cpu_threads': self.args['num_cpu_threads'],             # C++用这个来决定线程池大小
-                'num_searches': self.args['num_searches']                    # C++ MCTS的模拟次数
+                'num_selfPlay_episodes': self.args['num_selfPlay_episodes'],
+                'num_cpu_threads': self.args['num_cpu_threads'],
+                'num_searches': self.args['num_searches']
             }
-            # ====================================================
 
             cpp_mcts_engine.run_parallel_self_play(job_queue, result_queue, final_data_queue, cpp_args)
 
@@ -141,18 +125,24 @@ class Coach:
             server_thread.join()
 
             print("\n自我对弈完成！正在收集数据...")
+            # 这个数据收集逻辑是正确的
             with tqdm.tqdm(total=self.args['num_selfPlay_episodes'], desc="收集数据") as pbar:
-                while pbar.n < self.args['num_selfPlay_episodes']:
+                games_processed = 0
+                while games_processed < self.args['num_selfPlay_episodes']:
                     try:
-                        result = final_data_queue.get_nowait()
+                        result = final_data_queue.get(timeout=1.0) # 加一个超时以防万一
                         if result.get("type") == "data":
                             self.training_data.extend(result.get("data", []))
+                            games_processed += 1
                             pbar.update(1)
                     except queue.Empty:
-                        break
+                        print("\n警告：数据队列为空，但自我对弈已结束。可能某些对局未能生成数据。")
+                        break # 如果队列空了，就跳出循环
 
             print(f"\n经验库大小: {len(self.training_data)}")
-            self.training_data = self.training_data[-self.args['data_max_size']:]
+            if len(self.training_data) > self.args['data_max_size']:
+                self.training_data = self.training_data[-self.args['data_max_size']:]
+
 
             print("\n步骤2：训练神经网络 (使用GPU)...")
             if not self.training_data:
@@ -167,6 +157,7 @@ class Coach:
             print(f"模型 model_{i}.pth 已保存。")
         print(f"\n训练完成！")
 
+    # evaluate_models 函数无需改动
     def evaluate_models(self, model1_path, model2_path):
         print(f"\n------ 开始评估 (C++ 引擎驱动) ------")
         if not model1_path or not model2_path:
@@ -174,10 +165,12 @@ class Coach:
             return
         device_eval = torch.device("cpu")
         try:
-            model1 = ExtendedConnectNet(board_size=self.args['board_size'], num_res_blocks=self.args['num_res_blocks'], num_hidden=self.args['num_hidden']).to(device_eval)
+            model1 = ExtendedConnectNet(board_size=self.args['board_size'], num_res_blocks=self.args['num_res_blocks'],
+                                        num_hidden=self.args['num_hidden']).to(device_eval)
             model1.load_state_dict(torch.load(model1_path, map_location=device_eval))
             model1.eval()
-            model2 = ExtendedConnectNet(board_size=self.args['board_size'], num_res_blocks=self.args['num_res_blocks'], num_hidden=self.args['num_hidden']).to(device_eval)
+            model2 = ExtendedConnectNet(board_size=self.args['board_size'], num_res_blocks=self.args['num_res_blocks'],
+                                        num_hidden=self.args['num_hidden']).to(device_eval)
             model2.load_state_dict(torch.load(model2_path, map_location=device_eval))
             model2.eval()
         except Exception as e:
@@ -193,9 +186,12 @@ class Coach:
             p1 = model2 if i % 2 == 0 else model1
             p2 = model1 if i % 2 == 0 else model2
             winner = cpp_mcts_engine.play_game_for_eval(p1, p2, eval_args)
-            if winner == 1: scores[1 if i % 2 == 0 else -1] += 1
-            elif winner == -1: scores[-1 if i % 2 == 0 else 1] += 1
-            else: scores[0] += 1
+            if winner == 1:
+                scores[1 if i % 2 == 0 else -1] += 1
+            elif winner == -1:
+                scores[-1 if i % 2 == 0 else 1] += 1
+            else:
+                scores[0] += 1
 
         win_rate = scores[1] / self.args['num_eval_games'] if self.args['num_eval_games'] > 0 else 0
         print("\n------ 评估结果 ------")
@@ -206,6 +202,7 @@ class Coach:
             print("结论：新模型有显著提升！👍")
         else:
             print("结论：新模型提升不明显或没有提升。")
+
 
 if __name__ == '__main__':
     print(f"将要使用的设备 (主进程/训练): {device}")
