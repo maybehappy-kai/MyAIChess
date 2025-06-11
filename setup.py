@@ -23,9 +23,10 @@ ext_modules = [
         ],
         # In setup.py
         extra_compile_args={
-            'cxx': [],  # <-- 恢复为空列表
+            'cxx': ['/Zi', '/Od', '/FS'],  # <-- 恢复为空列表
         },
         extra_link_args=[
+            '/DEBUG',
             f"/LIBPATH:{python_lib_dir}",
             f"{python_lib_name}.lib"
         ]

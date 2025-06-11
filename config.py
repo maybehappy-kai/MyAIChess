@@ -4,7 +4,7 @@ args = {
     'num_searches': 50,  # 保证AI思考深度，确保CPU有足够的工作量
     'num_iterations': 10,  # 总迭代轮数
     'num_selfPlay_episodes': 28,  # 每轮自我对弈的局数
-    'num_cpu_threads': 14,       # <-- 新增：C++工作线程池的大小
+    'num_cpu_threads': 1,       # <-- 新增：C++工作线程池的大小
     'num_epochs': 20,  # 每轮训练的代数
     'batch_size': 32,  # 增大批处理大小，让GPU一次处理更多数据
     'learning_rate': 0.001,

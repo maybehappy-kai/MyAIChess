@@ -9,6 +9,10 @@
 
 class Gomoku {
 public:
+    // 静态常量，用于定义棋盘状态
+    static constexpr int EMPTY_SLOT = 0;
+    static constexpr int PLAYER_BLACK = 1;
+    static constexpr int PLAYER_WHITE = -1;
     // 构造函数与重置
     Gomoku(int board_size = 9, int num_rounds = 25);
     void reset();
@@ -21,8 +25,11 @@ public:
     int get_current_player() const;
 
     // 方便调试和查看状态的辅助函数
+    // ...
     int get_board_size() const;
+    int get_move_number() const; // <-- 新增这一行
     void print_board() const;
+    // ...
 
     // 实现深拷贝
     Gomoku(const Gomoku& other); // 拷贝构造函数
@@ -43,8 +50,5 @@ private:
     std::vector<std::vector<int>> board_pieces_;
     std::vector<std::vector<int>> board_territory_;
 
-    // 静态常量，用于定义棋盘状态
-    static constexpr int EMPTY_SLOT = 0;
-    static constexpr int PLAYER_BLACK = 1;
-    static constexpr int PLAYER_WHITE = -1;
+
 };

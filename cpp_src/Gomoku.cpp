@@ -110,7 +110,7 @@ std::pair<double, bool> Gomoku::get_game_ended() const {
         if (winner_val == 0.0) {
             return {0.001, true}; // 平局
         }
-        return {winner_val * current_player_, true};
+        return {winner_val, true};
     }
     return {0.0, false}; // 游戏未结束
 }
@@ -240,4 +240,11 @@ void Gomoku::print_board() const {
         std::cout << std::endl;
     }
     std::cout << "-------------------------" << std::endl;
+}
+
+// ... 在 print_board() 函数下方
+
+// --- 新增辅助函数实现 ---
+int Gomoku::get_move_number() const {
+    return current_move_number_;
 }

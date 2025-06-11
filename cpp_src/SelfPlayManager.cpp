@@ -96,147 +96,176 @@ void SelfPlayManager::worker_func(int worker_id) {
 
             // 单局游戏的主循环
             while (true) {
-                auto root = std::make_unique<Node>(game);
+                     auto root = std::make_unique<Node>(game);
 
-                // ==================== 1. 搜索阶段 (CPU密集) ====================
-                std::vector<Node*> leaves;
-                leaves.reserve(num_simulations);
-                for (int i = 0; i < num_simulations; ++i) {
-                    Node* node = root.get();
-                    while (node->is_fully_expanded()) {
-                        node = node->select_child();
-                    }
+                     // 1. 搜索阶段 (CPU密集)
+                     std::vector<Node*> leaves;
+                     leaves.reserve(num_simulations);
+                     for (int i = 0; i < num_simulations; ++i) {
+                         Node* node = root.get();
+                         while (node->is_fully_expanded()) {
+                             node = node->select_child();
+                         }
 
-                    auto [end_value, is_terminal] = node->game_state_.get_game_ended();
-                    if (is_terminal) {
-                        // 如果找到的叶节点本身是终止态，直接反向传播其价值，不送去评估
-                        node->backpropagate(end_value);
-                    } else {
-                        // 否则，将其加入待评估列表
-                        leaves.push_back(node);
-                    }
-                }
+                         auto [end_value, is_terminal] = node->game_state_.get_game_ended();
+                         if (is_terminal) {
+                             node->backpropagate(end_value);
+                         } else {
+                             leaves.push_back(node);
+                         }
+                     }
 
-                // ==================== 2. 批处理评估阶段 ====================
-                if (!leaves.empty()) {
-                    // 从所有叶子节点中提取状态，组成一个批次
-                    std::vector<std::vector<float>> state_batch;
-                    state_batch.reserve(leaves.size());
-                    for (const auto* leaf : leaves) {
-                        state_batch.push_back(leaf->game_state_.get_state());
-                    }
+                     // 2. 批处理评估阶段
+                     if (!leaves.empty()) {
+                         std::vector<std::vector<float>> state_batch;
+                         state_batch.reserve(leaves.size());
+                         for (const auto* leaf : leaves) {
+                             state_batch.push_back(leaf->game_state_.get_state());
+                         }
 
-                    py::list policy_batch;
-                    std::vector<double> value_batch;
+                         py::list policy_batch;
+                         std::vector<double> value_batch;
 
-                    // 将整个批次一次性发给Python
-                    long long request_id = g_request_id_counter++;
-                    {
-                        py::gil_scoped_acquire acquire;
-                        job_queue_.attr("put")(py::make_tuple(request_id, py::cast(state_batch)));
-                    }
+                         long long request_id = g_request_id_counter++;
+                         {
+                             py::gil_scoped_acquire acquire;
+                             job_queue_.attr("put")(py::make_tuple(request_id, py::cast(state_batch)));
+                         }
 
-                    // 等待这个批次的结果返回
-                    bool inference_done = false;
-                    while (!inference_done) {
-                        {
-                            py::gil_scoped_acquire acquire;
-                            try {
-                                py::tuple result = result_queue_.attr("get_nowait")();
-                                if (result[0].cast<long long>() == request_id) {
-                                    policy_batch = result[1].cast<py::list>();
-                                    value_batch = result[2].cast<std::vector<double>>();
-                                    inference_done = true;
-                                } else {
-                                    result_queue_.attr("put")(result);
-                                }
-                            } catch (const py::error_already_set& e) {
-                                if (!e.matches(queue_empty_exc_)) {
-                                     std::lock_guard<std::mutex> lock(g_io_mutex);
-                                     std::cerr << "[C++ Worker " << worker_id << "] Polling error: " << e.what() << std::endl;
-                                }
-                            }
-                        }
-                        if (!inference_done) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                        }
-                    }
+                         bool inference_done = false;
+                         while (!inference_done) {
+                             {
+                                 py::gil_scoped_acquire acquire;
+                                 try {
+                                     py::tuple result = result_queue_.attr("get_nowait")();
+                                     if (result[0].cast<long long>() == request_id) {
+                                         policy_batch = result[1].cast<py::list>();
+                                         value_batch = result[2].cast<std::vector<double>>();
+                                         inference_done = true;
+                                     } else {
+                                         result_queue_.attr("put")(result);
+                                     }
+                                 } catch (const py::error_already_set& e) {
+                                     if (!e.matches(queue_empty_exc_)) {
+                                          std::lock_guard<std::mutex> lock(g_io_mutex);
+                                          std::cerr << "[C++ Worker " << worker_id << "] Polling error: " << e.what() << std::endl;
+                                     }
+                                 }
+                             }
+                             if (!inference_done) {
+                                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                             }
+                         }
 
-                    // ==================== 3. 结果应用阶段 (CPU密集) ====================
-                    for (size_t i = 0; i < leaves.size(); ++i) {
-                        Node* leaf = leaves[i];
-                        std::vector<float> policy;
-                        py::list py_policy = policy_batch[i].cast<py::list>();
-                        policy.reserve(py::len(py_policy));
-                        for(py::handle item : py_policy) {
-                            policy.push_back(item.cast<float>());
-                        }
-                        double value = value_batch[i];
-                        leaf->expand(policy);
-                        leaf->backpropagate(value);
-                    }
-                }
+                         // 3. 结果应用阶段
+                         for (size_t i = 0; i < leaves.size(); ++i) {
+                             Node* leaf = leaves[i];
+                             std::vector<float> policy;
+                             py::list py_policy = policy_batch[i].cast<py::list>();
+                             policy.reserve(py::len(py_policy));
+                             for(py::handle item : py_policy) {
+                                 policy.push_back(item.cast<float>());
+                             }
+                             double value = value_batch[i];
+                             leaf->expand(policy);
+                             leaf->backpropagate(value);
+                         }
+                     }
 
-                // ==================== 4. 选择并执行动作 ====================
-                std::vector<float> action_probs(action_size, 0.0f);
-                for (const auto& child : root->children_) {
-                    if(child && child->action_taken_ >= 0 && child->action_taken_ < action_size)
-                        action_probs[child->action_taken_] = static_cast<float>(child->visit_count_);
-                }
+                     // 4. 选择并执行动作
+                     std::vector<float> action_probs(action_size, 0.0f);
+                     for (const auto& child : root->children_) {
+                         if(child && child->action_taken_ >= 0 && child->action_taken_ < action_size)
+                             action_probs[child->action_taken_] = static_cast<float>(child->visit_count_);
+                     }
 
-                // 归一化访问次数作为本轮的策略
-                float sum_visits = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
-                if (sum_visits > 0) {
-                    for (float& p : action_probs) { p /= sum_visits; }
-                }
+                     float sum_visits = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
+                     if (sum_visits > 0) {
+                         for (float& p : action_probs) { p /= sum_visits; }
+                     }
+                     episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
 
-                // 记录训练数据
-                episode_data.emplace_back(root->game_state_.get_state(), action_probs, root->game_state_.get_current_player());
+                     int action = -1;
+                     float max_visits_count = -1.0f;
+                     for (size_t i = 0; i < action_probs.size(); ++i) {
+                         if (action_probs[i] > max_visits_count) {
+                             max_visits_count = action_probs[i];
+                             action = static_cast<int>(i);
+                         }
+                     }
 
-                // 选择动作（使用我们之前修复过的健壮逻辑）
-                int action = -1;
-                float max_visits_count = -1.0f;
-                for (size_t i = 0; i < action_probs.size(); ++i) {
-                    if (action_probs[i] > max_visits_count) {
-                        max_visits_count = action_probs[i];
-                        action = static_cast<int>(i);
-                    }
-                }
-                if (action == -1) {
-                    auto valid_moves = game.get_valid_moves();
-                    for (size_t i = 0; i < valid_moves.size(); ++i) {
-                        if (valid_moves[i]) {
-                            action = static_cast<int>(i);
-                            break;
-                        }
-                    }
-                    if (action == -1) {
-                        {
-                            std::lock_guard<std::mutex> lock(g_io_mutex);
-                            std::cout << "[C++ Worker " << worker_id << "] No valid moves left. Ending game prematurely." << std::endl;
-                        }
-                        break;
-                    }
-                }
+                     if (action == -1) {
+                         auto valid_moves = game.get_valid_moves();
+                         for (size_t i = 0; i < valid_moves.size(); ++i) {
+                             if (valid_moves[i]) {
+                                 action = static_cast<int>(i);
+                                 break;
+                             }
+                         }
+                         if (action == -1) {
+                             {
+                                 std::lock_guard<std::mutex> lock(g_io_mutex);
+                                 std::cout << "[C++ Worker " << worker_id << "] No valid moves left. Ending game prematurely." << std::endl;
+                             }
+                             break;
+                         }
+                     }
 
-                game.execute_move(action);
+                     game.execute_move(action);
 
-                // 检查游戏是否结束
-                auto [final_value, is_done] = game.get_game_ended();
-                if (is_done) {
-                    py::gil_scoped_acquire acquire;
-                    py::list training_examples;
-                    for (const auto& example : episode_data) {
-                        double corrected_value = (std::get<2>(example) == PLAYER_BLACK) ? final_value : -final_value;
-                        training_examples.append(py::make_tuple(std::get<0>(example), std::get<1>(example), corrected_value));
-                    }
-                    py::dict data_to_send;
-                    data_to_send["type"] = "data";
-                    data_to_send["data"] = training_examples;
-                    final_data_queue_.attr("put")(data_to_send);
-                    break;
-                }
-            }
+                     {
+                         std::lock_guard<std::mutex> lock(g_io_mutex);
+                         // 打印一个清晰的分隔符，包含步数、执行的玩家和动作
+                         std::cout << "\n=============== Game " << game_idx << ", Move " << game.get_move_number()
+                                   << " by player " << (game.get_current_player() * -1) // 乘以-1得到刚刚走棋的玩家
+                                   << " (action: " << action << ") ===============\n";
+                         game.print_board(); // 调用我们写好的打印函数
+                         std::cout << "=========================================================\n" << std::endl;
+                     }
+
+                     // 在 worker_func 函数的游戏主循环 while(true) 的末尾...
+
+                     auto [final_value, is_done] = game.get_game_ended();
+
+                     // ==================== 从这里开始替换 ====================
+                     if (is_done) {
+                         // 步骤1：在纯C++的世界里，用C++的类型准备好所有训练数据
+                         std::vector<std::tuple<std::vector<float>, std::vector<float>, double>> cpp_training_examples;
+                         cpp_training_examples.reserve(episode_data.size());
+
+                         for (const auto& example : episode_data) {
+                             // 使用我们之前修正过的、正确的价值计算逻辑
+                             double corrected_value = final_value * std::get<2>(example);
+                             cpp_training_examples.emplace_back(std::get<0>(example), std::get<1>(example), corrected_value);
+                         }
+
+                         // 步骤2：获取GIL，然后一次性完成所有与Python的交互
+                         {
+                             py::gil_scoped_acquire acquire;
+
+                             // 将C++的vector一次性转换成Python的list
+                             py::list training_examples_list;
+                             for (const auto& ex : cpp_training_examples) {
+                                 training_examples_list.append(py::make_tuple(
+                                     py::cast(std::get<0>(ex)),
+                                     py::cast(std::get<1>(ex)),
+                                     py::cast(std::get<2>(ex))
+                                 ));
+                             }
+
+                             // 创建要发送的Python字典
+                             py::dict data_to_send;
+                             data_to_send["type"] = "data";
+                             data_to_send["data"] = training_examples_list;
+
+                             // 将最终的Python对象放入队列
+                             final_data_queue_.attr("put")(data_to_send);
+                         } // GIL在此处被安全释放
+
+                         break; // 结束当前这局游戏的循环
+                     }
+                     // ==================== 到这里替换结束 ====================
+                 } // while(true) for a single game ends here
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(g_io_mutex);
             std::cerr << "[C++ Worker " << worker_id << ", Game " << game_idx << "] FATAL_ERROR: A C++ standard exception occurred! what(): " << e.what() << std::endl;
