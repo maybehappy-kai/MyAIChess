@@ -19,14 +19,18 @@
 std::mutex g_io_mutex;
 std::atomic<long long> g_request_id_counter(0);
 
-// 这是Python调用的顶层函数，实现了创建管理线程、释放GIL并等待的健壮模式
-void run_parallel_self_play(py::object job_queue, py::object result_queue, py::object final_data_queue, py::dict args) {
-    auto manager = std::make_shared<SelfPlayManager>(job_queue, result_queue, final_data_queue, args);
+// 【修改】这是Python调用的顶层函数
+void run_parallel_self_play(const std::string& model_path, bool use_gpu, py::object final_data_queue, py::dict args) {
+    // 在这里创建C++推理引擎
+    auto engine = std::make_shared<InferenceEngine>(model_path, use_gpu);
+    // 将引擎传递给SelfPlayManager
+    auto manager = std::make_shared<SelfPlayManager>(engine, final_data_queue, args);
 
     std::thread cpp_manager_thread([manager]() {
         manager->run();
     });
 
+    // 释放GIL并等待线程结束的逻辑保持不变
     {
         py::gil_scoped_release release;
         if (cpp_manager_thread.joinable()) {
@@ -35,21 +39,15 @@ void run_parallel_self_play(py::object job_queue, py::object result_queue, py::o
     }
 }
 
-// 构造函数保持不变
-SelfPlayManager::SelfPlayManager(py::object job_queue, py::object result_queue, py::object final_data_queue, py::dict args)
-    : job_queue_(job_queue), result_queue_(result_queue),
-      final_data_queue_(final_data_queue), args_(args) {
+// 【修改】构造函数的实现
+SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::object final_data_queue, py::dict args)
+    : engine_(engine), final_data_queue_(final_data_queue), args_(args) { // 存储传入的引擎
+
     num_total_games_ = args_["num_selfPlay_episodes"].cast<int>();
     num_workers_ = args_["num_cpu_threads"].cast<int>();
-    try {
-        py::gil_scoped_acquire acquire;
-        py::module_ queue_module = py::module_::import("queue");
-        queue_empty_exc_ = queue_module.attr("Empty");
-    } catch (const py::error_already_set& e) {
-        std::lock_guard<std::mutex> lock(g_io_mutex);
-        std::cerr << "Failed to import queue module or get Empty exception: " << e.what() << std::endl;
-        throw;
-    }
+
+    // 移除对 Python queue.Empty 异常的依赖
+    // try { ... } catch { ... }
 }
 
 // run方法现在在独立的C++管理线程中执行，不需要自己管理GIL
@@ -109,68 +107,42 @@ void SelfPlayManager::worker_func(int worker_id) {
 
                          auto [end_value, is_terminal] = node->game_state_.get_game_ended();
                          if (is_terminal) {
-                             node->backpropagate(end_value);
+                             // --- vvv 这里是核心修正 vvv ---
+
+                                 // BUG: 直接传递绝对价值是错误的。
+                                 // node->backpropagate(end_value);
+
+                                 // FIX: 计算并传递相对价值。
+                                 // 价值必须从当前节点玩家的视角来看。
+                                 // 例如：如果是白棋(-1)的回合，但黑棋(+1)赢了，那么对白棋来说价值是 -1.0。
+                                 double relative_value = end_value * node->game_state_.get_current_player();
+                                 node->backpropagate(relative_value);
+
+                                 // --- ^^^ 修正结束 ^^^ ---
                          } else {
                              leaves.push_back(node);
                          }
                      }
 
-                     // 2. 批处理评估阶段
                      if (!leaves.empty()) {
-                         std::vector<std::vector<float>> state_batch;
-                         state_batch.reserve(leaves.size());
-                         for (const auto* leaf : leaves) {
-                             state_batch.push_back(leaf->game_state_.get_state());
-                         }
+                                          std::vector<std::vector<float>> state_batch;
+                                          state_batch.reserve(leaves.size());
+                                          for (const auto* leaf : leaves) {
+                                              state_batch.push_back(leaf->game_state_.get_state());
+                                          }
 
-                         py::list policy_batch;
-                         std::vector<double> value_batch;
+                                          // 直接在C++中调用推理引擎！没有Python，没有队列！
+                                          auto [policy_batch, value_batch] = engine_->infer(state_batch);
 
-                         long long request_id = g_request_id_counter++;
-                         {
-                             py::gil_scoped_acquire acquire;
-                             job_queue_.attr("put")(py::make_tuple(request_id, py::cast(state_batch)));
-                         }
-
-                         bool inference_done = false;
-                         while (!inference_done) {
-                             {
-                                 py::gil_scoped_acquire acquire;
-                                 try {
-                                     py::tuple result = result_queue_.attr("get_nowait")();
-                                     if (result[0].cast<long long>() == request_id) {
-                                         policy_batch = result[1].cast<py::list>();
-                                         value_batch = result[2].cast<std::vector<double>>();
-                                         inference_done = true;
-                                     } else {
-                                         result_queue_.attr("put")(result);
-                                     }
-                                 } catch (const py::error_already_set& e) {
-                                     if (!e.matches(queue_empty_exc_)) {
-                                          std::lock_guard<std::mutex> lock(g_io_mutex);
-                                          std::cerr << "[C++ Worker " << worker_id << "] Polling error: " << e.what() << std::endl;
-                                     }
-                                 }
-                             }
-                             if (!inference_done) {
-                                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                             }
-                         }
-
-                         // 3. 结果应用阶段
-                         for (size_t i = 0; i < leaves.size(); ++i) {
-                             Node* leaf = leaves[i];
-                             std::vector<float> policy;
-                             py::list py_policy = policy_batch[i].cast<py::list>();
-                             policy.reserve(py::len(py_policy));
-                             for(py::handle item : py_policy) {
-                                 policy.push_back(item.cast<float>());
-                             }
-                             double value = value_batch[i];
-                             leaf->expand(policy);
-                             leaf->backpropagate(value);
-                         }
-                     }
+                                          // 3. 结果应用阶段 (现在操作的都是纯C++类型)
+                                          for (size_t i = 0; i < leaves.size(); ++i) {
+                                              Node* leaf = leaves[i];
+                                              // policy_batch[i] 是 std::vector<float>
+                                              // value_batch[i] 是 float
+                                              leaf->expand(policy_batch[i]);
+                                              leaf->backpropagate(static_cast<double>(value_batch[i]));
+                                          }
+                                      }
 
                      // 4. 选择并执行动作
                      std::vector<float> action_probs(action_size, 0.0f);
@@ -212,6 +184,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                      }
 
                      game.execute_move(action);
+                     /*
 
                      {
                          std::lock_guard<std::mutex> lock(g_io_mutex);
@@ -222,6 +195,8 @@ void SelfPlayManager::worker_func(int worker_id) {
                          game.print_board(); // 调用我们写好的打印函数
                          std::cout << "=========================================================\n" << std::endl;
                      }
+
+                     */
 
                      // 在 worker_func 函数的游戏主循环 while(true) 的末尾...
 

@@ -10,20 +10,20 @@ py_minor = sys.version_info.minor
 python_lib_name = f"python{py_major}{py_minor}"
 python_lib_dir = os.path.join(os.path.dirname(sys.executable), 'libs')
 
-# =================== 这里是关键修改 ===================
+# =================== 核心修正区域 ===================
 ext_modules = [
     torch.utils.cpp_extension.CppExtension(
         'cpp_mcts_engine',
         [
+            # 确保列表中的每个文件都是一个独立的字符串
             'cpp_src/bindings.cpp',
             'cpp_src/SelfPlayManager.cpp',
-            'cpp_src/Gomoku.cpp',  # <-- 新增：告诉编译器编译Gomoku的实现
-            'cpp_src/Node.cpp'  # <-- 新增：告诉编译器编译Node的实现
-            # 'cpp_src/mcts.cpp' 已经被废弃，可以从列表中移除
+            'cpp_src/Gomoku.cpp',
+            'cpp_src/Node.cpp',
+            'cpp_src/InferenceEngine.cpp'  # <--- 这一行很可能是您出错的地方，请确保它和上一行有逗号隔开
         ],
-        # In setup.py
         extra_compile_args={
-            'cxx': ['/Zi', '/Od', '/FS'],  # <-- 恢复为空列表
+            'cxx': ['/Zi', '/Od', '/FS'],
         },
         extra_link_args=[
             '/DEBUG',

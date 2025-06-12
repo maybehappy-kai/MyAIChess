@@ -66,6 +66,8 @@ def inference_server_func(model, device, job_q, result_q, stop_event, board_size
             except queue.Empty:
                 # 队列为空是正常现象，继续循环，检查stop_event
                 continue
+
+
 # =============================================================
 
 
@@ -100,18 +102,11 @@ class Coach:
     def learn(self, start_epoch=1):
         for i in range(start_epoch, start_epoch + self.args['num_iterations']):
             print(f"------ 迭代轮次: {i} ------")
-            print("步骤1：启动C++引擎进行自我对弈 (此过程将阻塞，请耐心等待)...")
-            job_queue = queue.Queue() # maxsize不再需要，因为每次只放一个大的工作包
-            result_queue = queue.Queue()
-            final_data_queue = queue.Queue()
-            stop_event = threading.Event()
+            # --- vvv 这里是需要修改的C++引擎调用部分 vvv ---
 
-            # 注意：新的inference_server_func不再需要batch_size参数
-            server_thread = threading.Thread(
-                target=inference_server_func,
-                args=(self.model, device, job_queue, result_queue, stop_event, self.args['board_size'])
-            )
-            server_thread.start()
+            # --- vvv 这里是需要修改的核心区域 vvv ---
+            print("步骤1：启动纯C++引擎进行自我对弈 (此过程将阻塞)...")
+            final_data_queue = queue.Queue()
 
             cpp_args = {
                 'num_selfPlay_episodes': self.args['num_selfPlay_episodes'],
@@ -119,10 +114,24 @@ class Coach:
                 'num_searches': self.args['num_searches']
             }
 
-            cpp_mcts_engine.run_parallel_self_play(job_queue, result_queue, final_data_queue, cpp_args)
+            # 【修改】获取前一轮的模型路径，而不是当前轮次的
+            model_path_pt = f"model_{i - 1}.pt"
+            use_gpu = (device.type == 'cuda')
 
-            stop_event.set()
-            server_thread.join()
+            print(f"[Python Coach] 指示C++引擎使用模型: {model_path_pt}")
+            cpp_mcts_engine.run_parallel_self_play(
+                model_path_pt,
+                use_gpu,
+                final_data_queue,
+                cpp_args
+            )
+            # --- ^^^ 修改结束 ^^^ ---
+
+            # 5. 不再需要停止和加入推理线程
+            # stop_event.set()
+            # server_thread.join()
+
+            # --- ^^^ 修改结束 ^^^ ---
 
             print("\n自我对弈完成！正在收集数据...")
             # 这个数据收集逻辑是正确的
@@ -130,19 +139,18 @@ class Coach:
                 games_processed = 0
                 while games_processed < self.args['num_selfPlay_episodes']:
                     try:
-                        result = final_data_queue.get(timeout=1.0) # 加一个超时以防万一
+                        result = final_data_queue.get(timeout=1.0)  # 加一个超时以防万一
                         if result.get("type") == "data":
                             self.training_data.extend(result.get("data", []))
                             games_processed += 1
                             pbar.update(1)
                     except queue.Empty:
                         print("\n警告：数据队列为空，但自我对弈已结束。可能某些对局未能生成数据。")
-                        break # 如果队列空了，就跳出循环
+                        break  # 如果队列空了，就跳出循环
 
             print(f"\n经验库大小: {len(self.training_data)}")
             if len(self.training_data) > self.args['data_max_size']:
                 self.training_data = self.training_data[-self.args['data_max_size']:]
-
 
             print("\n步骤2：训练神经网络 (使用GPU)...")
             if not self.training_data:
@@ -153,8 +161,36 @@ class Coach:
                     self.train()
 
             self.scheduler.step()
-            torch.save(self.model.state_dict(), f"model_{i}.pth")
-            print(f"模型 model_{i}.pth 已保存。")
+            # --- vvv 这里是您需要修改的核心区域 vvv ---
+
+            # 1. 保存标准的 .pth 权重文件 (这行代码保持不变)
+            model_path_pth = f"model_{i}.pth"
+            torch.save(self.model.state_dict(), model_path_pth)
+            print(f"模型 {model_path_pth} 已保存。")
+
+            # 2. 【新增代码】导出可供C++使用的 TorchScript 模型
+            model_path_pt = f"model_{i}.pt"
+            self.model.eval()  # 导出前，必须将模型切换到评估模式
+
+            # 创建一个符合模型输入的示例张量。
+            # 形状为 (batch_size, channels, height, width)
+            example_input = torch.rand(
+                1,
+                6,  # 根据您的Gomoku.cpp，状态有6个通道
+                self.args['board_size'],
+                self.args['board_size']
+            ).to(device)
+
+            try:
+                # 使用 torch.jit.trace 功能追踪模型的计算图
+                traced_script_module = torch.jit.trace(self.model, example_input)
+                # 将追踪到的计算图保存为 .pt 文件
+                traced_script_module.save(model_path_pt)
+                print(f"TorchScript模型 {model_path_pt} 已成功导出，可供C++使用。")
+            except Exception as e:
+                print(f"【错误】导出TorchScript模型失败: {e}")
+
+            # --- ^^^ 修改结束 ^^^ ---
         print(f"\n训练完成！")
 
     # evaluate_models 函数无需改动
@@ -212,6 +248,7 @@ if __name__ == '__main__':
         num_res_blocks=args['num_res_blocks'],
         num_hidden=args['num_hidden']
     ).to(device)
+
     if model_before_training:
         try:
             print(f"找到最新模型 {model_before_training}，将从第 {start_epoch} 轮开始继续训练...")
@@ -222,9 +259,28 @@ if __name__ == '__main__':
             start_epoch = 1
             model_before_training = None
     else:
+        # --- vvv 这里是需要修改的核心区域 vvv ---
         print("未找到任何已有模型，将从第 1 轮开始全新训练。")
+        print("正在创建并保存初始随机模型 (model_0)...")
+
+        # 【新增代码】为第一轮自我对弈准备一个“第0代”模型
+        model.eval()
+        example_input = torch.rand(1, 6, args['board_size'], args['board_size']).to(device)
+        try:
+            traced_script_module = torch.jit.trace(model, example_input)
+            traced_script_module.save("model_0.pt")
+            torch.save(model.state_dict(), "model_0.pth")
+            print("初始模型 model_0.pt 和 model_0.pth 已保存。")
+        except Exception as e:
+            print(f"【错误】创建初始模型失败: {e}, 程序无法继续。")
+            exit()  # 如果初始模型都创建失败，直接退出
+
+        start_epoch = 1  # 确认从第1轮开始
+        # --- ^^^ 修改结束 ^^^ ---
+
     coach = Coach(model, args)
     coach.learn(start_epoch=start_epoch)
+    # ... (后续评估代码不变) ...
     model_after_training, _ = find_latest_model_file()
     if model_before_training and model_after_training != model_before_training:
         coach.evaluate_models(model_before_training, model_after_training)

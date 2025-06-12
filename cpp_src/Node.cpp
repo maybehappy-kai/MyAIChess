@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <iostream> // 为了 std::cout
 
 // 构造函数
 Node::Node(Gomoku game_state, Node* parent, int action_taken, float prior)
@@ -61,15 +62,31 @@ double Node::get_ucb(const Node* child) const {
     return q_value + u_value;
 }
 
-// 根据策略扩展节点
+// file: cpp_src/Node.cpp
+
+// file: cpp_src/Node.cpp
+
+// file: cpp_src/Node.cpp
+
+// ... (其他函数，如构造、析构、select_child等保持不变)
+
 void Node::expand(const std::vector<float>& policy) {
     const auto valid_moves = game_state_.get_valid_moves();
     children_.reserve(policy.size());
+
     for (size_t action = 0; action < policy.size(); ++action) {
+        // 这个if判断是MCTS扩展的核心，确保我们只探索有效且有意义的移动
         if (policy[action] > 0.0f && valid_moves[action]) {
-            auto child_game_ptr = std::make_unique<Gomoku>(game_state_);
-            child_game_ptr->execute_move(action);
-            children_.push_back(std::make_unique<Node>(std::move(*child_game_ptr), this, action, policy[action]));
+
+            // 这是最终的、正确的逻辑：
+            // 1. 为子节点创建一个当前游戏状态的全新副本
+            Gomoku next_game_state = this->game_state_;
+
+            // 2. 在这个副本上安全地执行一步
+            next_game_state.execute_move(action);
+
+            // 3. 将这个被推进了一步的、全新的状态传递给子节点
+            children_.push_back(std::make_unique<Node>(next_game_state, this, action, policy[action]));
         }
     }
 }

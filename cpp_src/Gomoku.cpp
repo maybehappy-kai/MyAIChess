@@ -71,8 +71,8 @@ std::vector<bool> Gomoku::get_valid_moves() const {
     std::vector<bool> valid_moves(board_size_ * board_size_);
     for (int r = 0; r < board_size_; ++r) {
         for (int c = 0; c < board_size_; ++c) {
-            valid_moves[r * board_size_ + c] = (board_pieces_[r][c] == EMPTY_SLOT) &&
-                                              (board_territory_[r][c] != -current_player_);
+            valid_moves[r * board_size_ + c] = (board_pieces_[r][c] == EMPTY_SLOT);
+            //&& (board_territory_[r][c] != -current_player_);
         }
     }
     return valid_moves;
@@ -83,6 +83,10 @@ void Gomoku::execute_move(int action) {
     int r = action / board_size_;
     int c = action % board_size_;
 
+    // --- vvv 在这里新增一行诊断代码 vvv ---
+        // std::cout << "[DEBUG] execute_move called with action=" << action << ". Target square (" << r << "," << c << ") has piece=" << board_pieces_[r][c] << std::endl;
+        // --- ^^^ 新增代码结束 ^^^ ---
+
     if (r < 0 || r >= board_size_ || c < 0 || c >= board_size_ ||
         board_pieces_[r][c] != EMPTY_SLOT || board_territory_[r][c] == -current_player_) {
         throw std::invalid_argument("Invalid move action.");
@@ -90,7 +94,7 @@ void Gomoku::execute_move(int action) {
 
     board_pieces_[r][c] = current_player_;
 
-    process_lines_and_territory(r, c);
+    //process_lines_and_territory(r, c);
 
     current_move_number_++;
     current_player_ *= -1; // 严格交替走子
