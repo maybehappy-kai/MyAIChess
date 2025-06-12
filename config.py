@@ -2,7 +2,7 @@
 args = {
     'C': 2,
     'num_searches': 600,  # 保证AI思考深度，确保CPU有足够的工作量
-    'num_iterations': 100,  # 总迭代轮数
+    'num_iterations': 10,  # 总迭代轮数
     'num_selfPlay_episodes': 320,  # 每轮自我对弈的局数
     'num_cpu_threads': 16,       # <-- 新增：C++工作线程池的大小
     'num_epochs': 2,  # 每轮训练的代数

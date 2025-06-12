@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from neural_net import ExtendedConnectNet
 from config import args
 import cpp_mcts_engine
+from collections import deque  # <-- 新增这一行
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -78,7 +79,7 @@ class Coach:
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.args['learning_rate'], weight_decay=0.0001)
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.args['num_epochs'])
         self.scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
-        self.training_data = []
+        self.training_data = deque(maxlen=self.args['data_max_size'])  # <-- 修改这一行
 
     def train(self):
         self.model.train()
@@ -149,8 +150,8 @@ class Coach:
                         break  # 如果队列空了，就跳出循环
 
             print(f"\n经验库大小: {len(self.training_data)}")
-            if len(self.training_data) > self.args['data_max_size']:
-                self.training_data = self.training_data[-self.args['data_max_size']:]
+            # if len(self.training_data) > self.args['data_max_size']:
+            # self.training_data = self.training_data[-self.args['data_max_size']:]
 
             print("\n步骤2：训练神经网络 (使用GPU)...")
             if not self.training_data:
@@ -286,3 +287,21 @@ if __name__ == '__main__':
         coach.evaluate_models(model_before_training, model_after_training)
     else:
         print("\n未进行有效的新一轮训练或未找到旧模型，跳过评估。")
+
+        # ====================== 新增的核心清理代码 ======================
+        # 在程序即将结束时，手动触发资源释放，避免退出时卡死
+
+        print("\n训练全部完成，正在手动清理内存...")
+
+        # 检查coach对象是否存在，并清空其内部的大数据结构
+        if 'coach' in locals() and hasattr(coach, 'training_data'):
+            coach.training_data.clear()
+            print("经验回放池已清空。")
+
+        # 手动调用Python的垃圾回收器
+        import gc
+
+        gc.collect()
+
+        print("内存清理完成。程序即将退出。")
+        # ===============================================================
