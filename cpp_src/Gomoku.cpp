@@ -4,6 +4,8 @@
 #include <numeric>
 #include <algorithm>
 #include <array>
+#include <mutex>        // <-- 新增
+//extern std::mutex g_io_mutex; // <-- 新增
 
 // 构造函数
 Gomoku::Gomoku(int board_size, int num_rounds)
@@ -20,27 +22,40 @@ void Gomoku::reset() {
     current_move_number_ = 0;
 }
 
-// 拷贝构造函数 (实现深拷贝)
+// file: cpp_src/Gomoku.cpp
+// ===================== 这是最关键的、必须应用的修改 =====================
+
+// 拷贝构造函数 (实现真正的深拷贝)
 Gomoku::Gomoku(const Gomoku& other)
     : board_size_(other.board_size_),
       max_total_moves_(other.max_total_moves_),
       current_player_(other.current_player_),
-      current_move_number_(other.current_move_number_),
-      board_pieces_(other.board_pieces_),
-      board_territory_(other.board_territory_) {}
+      current_move_number_(other.current_move_number_) {
 
-// 拷贝赋值运算符 (实现深拷贝)
+    // 手动为二维向量分配空间并逐元素拷贝
+    board_pieces_.assign(other.board_pieces_.begin(), other.board_pieces_.end());
+    board_territory_.assign(other.board_territory_.begin(), other.board_territory_.end());
+}
+
+// 拷贝赋值运算符 (实现真正的深拷贝)
 Gomoku& Gomoku::operator=(const Gomoku& other) {
     if (this == &other) {
         return *this;
     }
-    // board_size_ 和 max_total_moves_ 是 const，不能被赋值，但我们假设它们是兼容的
+
+    // const 成员变量不能被赋值
+    // 我们假设 board_size_ 和 max_total_moves_ 总是相等的
+
     current_player_ = other.current_player_;
     current_move_number_ = other.current_move_number_;
-    board_pieces_ = other.board_pieces_;
-    board_territory_ = other.board_territory_;
+
+    // 手动为二维向量分配空间并逐元素拷贝
+    board_pieces_.assign(other.board_pieces_.begin(), other.board_pieces_.end());
+    board_territory_.assign(other.board_territory_.begin(), other.board_territory_.end());
+
     return *this;
 }
+// ===================== 修改结束 =====================
 
 // 获取神经网络所需的状态张量 (扁平化)
 std::vector<float> Gomoku::get_state() const {
@@ -82,6 +97,15 @@ std::vector<bool> Gomoku::get_valid_moves() const {
 void Gomoku::execute_move(int action) {
     int r = action / board_size_;
     int c = action % board_size_;
+    // --- vvv 新增诊断日志 vvv ---
+        /*{
+            std::lock_guard<std::mutex> lock(g_io_mutex); // g_io_mutex 需要被包含进来
+            std::cout << "[Gomoku::execute_move] Received action=" << action
+                      << ". Checking square (" << r << "," << c << ")."
+                      << " Current piece on that square: " << board_pieces_[r][c]
+                      << std::endl;
+        }*/
+        // --- ^^^ 诊断日志结束 ^^^ ---
 
     // --- vvv 在这里新增一行诊断代码 vvv ---
         // std::cout << "[DEBUG] execute_move called with action=" << action << ". Target square (" << r << "," << c << ") has piece=" << board_pieces_[r][c] << std::endl;

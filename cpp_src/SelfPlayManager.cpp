@@ -97,34 +97,39 @@ void SelfPlayManager::worker_func(int worker_id) {
                      auto root = std::make_unique<Node>(game);
 
                      // 1. 搜索阶段 (CPU密集)
-                     std::vector<Node*> leaves;
-                     leaves.reserve(num_simulations);
-                     for (int i = 0; i < num_simulations; ++i) {
-                         Node* node = root.get();
-                         while (node->is_fully_expanded()) {
-                             node = node->select_child();
-                         }
+                                          std::vector<Node*> leaves;
+                                          leaves.reserve(num_simulations);
+                                          for (int i = 0; i < num_simulations; ++i) {
+                                              Node* node = root.get();
+                                              while (node->is_fully_expanded()) {
+                                                  node = node->select_child();
+                                              }
 
-                         auto [end_value, is_terminal] = node->game_state_.get_game_ended();
-                         if (is_terminal) {
-                             // --- vvv 这里是核心修正 vvv ---
+                                              auto [end_value, is_terminal] = node->game_state_.get_game_ended();
 
-                                 // BUG: 直接传递绝对价值是错误的。
-                                 // node->backpropagate(end_value);
+                                              // ===================== 核心修正 =====================
+                                              // 无论游戏是否在当前节点结束，我们都需要反向传播价值
+                                              // 如果游戏结束了，价值就是最终结局的价值
+                                              // 如果没结束，价值将在神经网络推理后确定
+                                              double value_to_propagate = end_value;
 
-                                 // FIX: 计算并传递相对价值。
-                                 // 价值必须从当前节点玩家的视角来看。
-                                 // 例如：如果是白棋(-1)的回合，但黑棋(+1)赢了，那么对白棋来说价值是 -1.0。
-                                 double relative_value = end_value * node->game_state_.get_current_player();
-                                 node->backpropagate(relative_value);
+                                              if (is_terminal) {
+                                                 // 如果是终局，从当前玩家视角计算价值并立即反向传播
+                                                 // 然后用 `continue` 跳过后续的扩展步骤，开始下一次模拟
+                                                  value_to_propagate *= node->game_state_.get_current_player();
+                                                  node->backpropagate(value_to_propagate);
+                                                  continue;
+                                              }
 
-                                 // --- ^^^ 修正结束 ^^^ ---
-                         } else {
-                             leaves.push_back(node);
-                         }
-                     }
+                                              // 如果不是终局，才将此节点加入待扩展列表
+                                              // 这是为了之后进行批量神经网络推理
+                                              leaves.push_back(node);
+                                              // ====================================================
+                                          }
 
                      if (!leaves.empty()) {
+                     std::sort(leaves.begin(), leaves.end());
+                                              leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
                                           std::vector<std::vector<float>> state_batch;
                                           state_batch.reserve(leaves.size());
                                           for (const auto* leaf : leaves) {
@@ -145,45 +150,80 @@ void SelfPlayManager::worker_func(int worker_id) {
                                       }
 
                      // 4. 选择并执行动作
-                     std::vector<float> action_probs(action_size, 0.0f);
-                     for (const auto& child : root->children_) {
-                         if(child && child->action_taken_ >= 0 && child->action_taken_ < action_size)
-                             action_probs[child->action_taken_] = static_cast<float>(child->visit_count_);
-                     }
+                                          std::vector<float> action_probs(action_size, 0.0f);
+                                          for (const auto& child : root->children_) {
+                                              if(child && child->action_taken_ >= 0 && child->action_taken_ < action_size)
+                                                  action_probs[child->action_taken_] = static_cast<float>(child->visit_count_);
+                                          }
 
-                     float sum_visits = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
-                     if (sum_visits > 0) {
-                         for (float& p : action_probs) { p /= sum_visits; }
-                     }
-                     episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
+                                          float sum_visits = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
+                                          if (sum_visits > 0) {
+                                              for (float& p : action_probs) { p /= sum_visits; }
+                                          }
+                                          episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
 
-                     int action = -1;
-                     float max_visits_count = -1.0f;
-                     for (size_t i = 0; i < action_probs.size(); ++i) {
-                         if (action_probs[i] > max_visits_count) {
-                             max_visits_count = action_probs[i];
-                             action = static_cast<int>(i);
-                         }
-                     }
+                                          int action = -1;
+                                          // 优先从MCTS的搜索结果中选择访问次数最多的动作
+                                          if (!root->children_.empty()) {
+                                              float max_visits_count = -1.0f;
+                                              for (size_t i = 0; i < action_probs.size(); ++i) {
+                                                  if (action_probs[i] > max_visits_count) {
+                                                      max_visits_count = action_probs[i];
+                                                      action = static_cast<int>(i);
+                                                  }
+                                              }
+                                          }
 
-                     if (action == -1) {
-                         auto valid_moves = game.get_valid_moves();
-                         for (size_t i = 0; i < valid_moves.size(); ++i) {
-                             if (valid_moves[i]) {
-                                 action = static_cast<int>(i);
-                                 break;
-                             }
-                         }
-                         if (action == -1) {
-                             {
-                                 std::lock_guard<std::mutex> lock(g_io_mutex);
-                                 std::cout << "[C++ Worker " << worker_id << "] No valid moves left. Ending game prematurely." << std::endl;
-                             }
-                             break;
-                         }
-                     }
+                                          // 如果MCTS没有给出选择 (action == -1)，则从所有合法走法中随机选择一个
+                                          if (action == -1) {
+                                              auto valid_moves = game.get_valid_moves();
+                                              std::vector<int> valid_move_indices;
+                                              for (size_t i = 0; i < valid_moves.size(); ++i) {
+                                                  if (valid_moves[i]) {
+                                                      valid_move_indices.push_back(i);
+                                                  }
+                                              }
 
-                     game.execute_move(action);
+                                              if (!valid_move_indices.empty()) {
+                                                 // 从所有合法走法中随机挑选一个
+                                                 std::random_device rd;
+                                                 std::mt19937 gen(rd());
+                                                 std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
+                                                 action = valid_move_indices[distrib(gen)];
+                                              } else {
+                                                 // 棋盘已满，没有任何合法走法，结束游戏
+                                                  {
+                                                      std::lock_guard<std::mutex> lock(g_io_mutex);
+                                                      std::cout << "[C++ Worker " << worker_id << "] No valid moves left. Ending game prematurely." << std::endl;
+                                                  }
+                                                  break; // 退出当前这局游戏的循环
+                                              }
+                                          }
+
+                                         // ===================== 新增诊断日志 =====================
+                                                             /* {
+                                                                  std::lock_guard<std::mutex> lock(g_io_mutex);
+                                                                  std::cout << "\n[C++ Worker " << worker_id << " | Game " << game_idx << "] DEBUG INFO BEFORE MOVE:" << std::endl;
+                                                                  std::cout << "  - Player to move: " << game.get_current_player() << std::endl;
+                                                                  std::cout << "  - Chosen Action: " << action << std::endl;
+                                                                  std::cout << "  - Current Board State:" << std::endl;
+                                                                  game.print_board(); // 打印当前棋盘
+
+                                                                  // 打印所有它认为的合法走法
+                                                                  auto valid_moves_for_debug = game.get_valid_moves();
+                                                                  std::cout << "  - Perceived Valid Moves (1=Valid): ";
+                                                                  for(size_t i = 0; i < valid_moves_for_debug.size(); ++i) {
+                                                                      if(valid_moves_for_debug[i]) {
+                                                                          std::cout << i << " ";
+                                                                      }
+                                                                  }
+                                                                  std::cout << std::endl;
+                                                                  std::cout << "====================================================\n" << std::endl;
+                                                              }*/
+                                                              // ===================== 诊断日志结束 =====================
+
+                                                              // 执行选定的动作
+                                                              game.execute_move(action);
                      /*
 
                      {
