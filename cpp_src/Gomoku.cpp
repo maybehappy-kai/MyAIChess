@@ -81,13 +81,14 @@ std::vector<float> Gomoku::get_state() const {
     return state;
 }
 
-// 获取所有合法走子的位置 (扁平化)
+// file: cpp_src/Gomoku.cpp (修正后)
+
 std::vector<bool> Gomoku::get_valid_moves() const {
     std::vector<bool> valid_moves(board_size_ * board_size_);
     for (int r = 0; r < board_size_; ++r) {
         for (int c = 0; c < board_size_; ++c) {
-            valid_moves[r * board_size_ + c] = (board_pieces_[r][c] == EMPTY_SLOT);
-            //&& (board_territory_[r][c] != -current_player_);
+            // 一个合法的走法，必须同时满足“这个点是空的”和“这个点不是对方的领地”
+            valid_moves[r * board_size_ + c] = (board_pieces_[r][c] == EMPTY_SLOT) && (board_territory_[r][c] != -current_player_);
         }
     }
     return valid_moves;
@@ -118,7 +119,7 @@ void Gomoku::execute_move(int action) {
 
     board_pieces_[r][c] = current_player_;
 
-    //process_lines_and_territory(r, c);
+    process_lines_and_territory(r, c);
 
     current_move_number_++;
     current_player_ *= -1; // 严格交替走子

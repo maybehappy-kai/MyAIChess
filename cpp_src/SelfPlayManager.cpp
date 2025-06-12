@@ -149,30 +149,36 @@ void SelfPlayManager::worker_func(int worker_id) {
                                           }
                                       }
 
+                     // file: cpp_src/SelfPlayManager.cpp (替换后的新代码)
+
+                     // ...
                      // 4. 选择并执行动作
-                                          std::vector<float> action_probs(action_size, 0.0f);
-                                          for (const auto& child : root->children_) {
-                                              if(child && child->action_taken_ >= 0 && child->action_taken_ < action_size)
-                                                  action_probs[child->action_taken_] = static_cast<float>(child->visit_count_);
-                                          }
+                     std::vector<float> action_probs(action_size, 0.0f);
+                     if (!root->children_.empty()) {
+                         for (const auto& child : root->children_) {
+                             if (child && child->action_taken_ >= 0 && child->action_taken_ < action_size) {
+                                 action_probs[child->action_taken_] = static_cast<float>(child->visit_count_);
+                             }
+                         }
+                         float sum_visits = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
+                         if (sum_visits > 0) {
+                             for (float& p : action_probs) { p /= sum_visits; }
+                         }
+                     }
+                     episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
 
-                                          float sum_visits = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
-                                          if (sum_visits > 0) {
-                                              for (float& p : action_probs) { p /= sum_visits; }
-                                          }
-                                          episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
-
-                                          int action = -1;
-                                          // 优先从MCTS的搜索结果中选择访问次数最多的动作
-                                          if (!root->children_.empty()) {
-                                              float max_visits_count = -1.0f;
-                                              for (size_t i = 0; i < action_probs.size(); ++i) {
-                                                  if (action_probs[i] > max_visits_count) {
-                                                      max_visits_count = action_probs[i];
-                                                      action = static_cast<int>(i);
-                                                  }
-                                              }
-                                          }
+                     int action = -1;
+                     // 【核心修正】直接从子节点中找到访问次数最多的动作
+                     if (!root->children_.empty()) {
+                         int max_visits = -1;
+                         for (const auto& child : root->children_) {
+                             if (child && child->visit_count_ > max_visits) {
+                                 max_visits = child->visit_count_;
+                                 action = child->action_taken_;
+                             }
+                         }
+                     }
+                     // ...
 
                                           // 如果MCTS没有给出选择 (action == -1)，则从所有合法走法中随机选择一个
                                           if (action == -1) {
