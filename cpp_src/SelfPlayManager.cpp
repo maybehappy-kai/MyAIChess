@@ -75,6 +75,7 @@ void SelfPlayManager::run() {
     }
 }
 
+// 【请用下面的完整函数替换你文件中旧的 worker_func】
 void SelfPlayManager::worker_func(int worker_id) {
     while (true) {
         int game_idx;
@@ -85,45 +86,11 @@ void SelfPlayManager::worker_func(int worker_id) {
         try {
             Gomoku game;
             std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
-
-            // ====================== 核心修正区域：工作函数 ======================
-            // 直接使用C++成员变量，不再访问Python字典
             const int num_simulations = this->num_simulations_;
-            // ===============================================================
-
             const int action_size = game.get_board_size() * game.get_board_size();
 
             while (true) {
                 auto root = std::make_unique<Node>(game);
-
-                // vvvvvvvvvvvv 【新增代码：添加狄利克雷噪声】 vvvvvvvvvvvv
-                    // 仅在自我对弈时添加噪声，评估时不需要
-                    const float dirichlet_alpha = 0.3f; // 建议从Python的args传入
-                    if (!root->children_.empty()) {
-                        std::vector<float> dirichlet_noise;
-                        std::random_device rd;
-                        std::mt19937 gen(rd());
-                        // 为每个合法的子节点生成一个gamma分布的随机数
-                        std::gamma_distribution<float> gamma(dirichlet_alpha, 1.0f);
-                        for (size_t i = 0; i < root->children_.size(); ++i) {
-                            dirichlet_noise.push_back(gamma(gen));
-                        }
-
-                        // 归一化噪声
-                        float sum_noise = std::accumulate(dirichlet_noise.begin(), dirichlet_noise.end(), 0.0f);
-                        if (sum_noise > 0) {
-                            for (float& n : dirichlet_noise) {
-                                n /= sum_noise;
-                            }
-                        }
-
-                        // 将噪声混合到先验概率中 (通常75%的原策略 + 25%的噪声)
-                        const float noise_fraction = 0.25f;
-                        for (size_t i = 0; i < root->children_.size(); ++i) {
-                            root->children_[i]->prior_ = root->children_[i]->prior_ * (1.0f - noise_fraction) + dirichlet_noise[i] * noise_fraction;
-                        }
-                    }
-                    // ^^^^^^^^^^^^ 【新增代码结束】 ^^^^^^^^^^^^
 
                 std::vector<Node*> leaves;
                 leaves.reserve(num_simulations);
@@ -158,60 +125,57 @@ void SelfPlayManager::worker_func(int worker_id) {
                     }
                 }
 
+                // --- 动作选择逻辑 ---
+                int action = -1;
                 std::vector<float> action_probs(action_size, 0.0f);
+
+                // 1. 计算基于访问次数的概率分布和总访问次数
+                float sum_visits = 0.0f;
                 if (!root->children_.empty()) {
                     for (const auto& child : root->children_) {
                         if (child && child->action_taken_ >= 0 && child->action_taken_ < action_size) {
                             action_probs[child->action_taken_] = static_cast<float>(child->visit_count_);
+                            sum_visits += child->visit_count_;
                         }
                     }
-                    float sum_visits = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
                     if (sum_visits > 0) {
-                        for (float& p : action_probs) { p /= sum_visits; }
+                        for (float& p : action_probs) {
+                            p /= sum_visits;
+                        }
                     }
                 }
                 episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
-                //int action = -1;
 
-                // vvvvvvvvvvvv 【核心修改区域】 vvvvvvvvvvvv
-                int action = -1;
-                // 获取当前是第几步棋
-                const int move_number = game.get_move_number();
+                // 2. 根据温度采样或确定性选择来决定动作
+                if (sum_visits > 0) {
+                    const int move_number = game.get_move_number();
+                    const int temperature_moves = 15;
 
-                // 假设我们设置在游戏的前15步进行探索性采样
-                const int temperature_moves = 15;
-
-                if (move_number < temperature_moves) {
-                    // ---- 温度采样：根据概率分布随机选择 ----
-                    if (!action_probs.empty()) {
+                    if (move_number < temperature_moves) {
+                        // 温度采样
                         std::random_device rd;
                         std::mt19937 gen(rd());
-                        // action_probs 已经是归一化的概率分布
                         std::discrete_distribution<> distrib(action_probs.begin(), action_probs.end());
                         action = distrib(gen);
-                    }
-                } else {
-
-                    // ---- 确定性选择：选择访问次数最多的棋步 (你原来的逻辑) ----
-                    if (!root->children_.empty()) {
-                        int max_visits = -1;
-                        for (const auto& child : root->children_) {
-                            if (child && child->visit_count_ > max_visits) {
-                                max_visits = child->visit_count_;
-                                action = child->action_taken_;
+                    } else {
+                        // 确定性选择 (选择访问次数最多的)
+                        float max_prob = -1.0f;
+                        for (size_t i = 0; i < action_probs.size(); ++i) {
+                            if (action_probs[i] > max_prob) {
+                                max_prob = action_probs[i];
+                                action = i;
                             }
                         }
                     }
                 }
 
-                // ^^^^^^^^^^^^ 【核心修改区域结束】 ^^^^^^^^^^^^
-
+                // 3. 如果MCTS后依然没有选出动作，则进行安全的回退
                 if (action == -1) {
                     auto valid_moves = game.get_valid_moves();
                     std::vector<int> valid_move_indices;
                     for (size_t i = 0; i < valid_moves.size(); ++i) {
                         if (valid_moves[i]) {
-                            valid_move_indices.push_back(i);
+                            valid_move_indices.push_back(static_cast<int>(i));
                         }
                     }
                     if (!valid_move_indices.empty()) {
@@ -223,6 +187,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                         break;
                     }
                 }
+
                 game.execute_move(action);
 
                 auto [final_value, is_done] = game.get_game_ended();
