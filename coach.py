@@ -15,6 +15,20 @@ from neural_net import ExtendedConnectNet
 from config import args
 import cpp_mcts_engine
 from collections import deque  # <-- 新增这一行
+import platform
+import ctypes
+
+
+# 定义一个仅在Windows下生效的内存清理函数
+def clear_windows_memory():
+    if platform.system() == "Windows":
+        try:
+            # 调用Windows API来强制清理当前进程的内存工作集
+            ctypes.windll.psapi.EmptyWorkingSet(ctypes.windll.kernel32.GetCurrentProcess())
+            print("[System] Windows memory working set has been cleared.")
+        except Exception as e:
+            print(f"[System] Failed to clear Windows memory working set: {e}")
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -192,53 +206,75 @@ class Coach:
                 print(f"【错误】导出TorchScript模型失败: {e}")
 
             # --- ^^^ 修改结束 ^^^ ---
+            clear_windows_memory()
         print(f"\n训练完成！")
 
     # evaluate_models 函数无需改动
     def evaluate_models(self, model1_path, model2_path):
-        print(f"\n------ 开始评估 (C++ 引擎驱动) ------")
-        if not model1_path or not model2_path:
-            print("缺少模型文件，跳过评估。")
-            return
-        device_eval = torch.device("cpu")
-        try:
-            model1 = ExtendedConnectNet(board_size=self.args['board_size'], num_res_blocks=self.args['num_res_blocks'],
-                                        num_hidden=self.args['num_hidden']).to(device_eval)
-            model1.load_state_dict(torch.load(model1_path, map_location=device_eval))
-            model1.eval()
-            model2 = ExtendedConnectNet(board_size=self.args['board_size'], num_res_blocks=self.args['num_res_blocks'],
-                                        num_hidden=self.args['num_hidden']).to(device_eval)
-            model2.load_state_dict(torch.load(model2_path, map_location=device_eval))
-            model2.eval()
-        except Exception as e:
-            print(f"加载评估模型失败: {e}, 跳过评估。")
+        print(f"\n------ 开始分组诊断式评估 (C++ 引擎驱动) ------")
+        if not model1_path or not os.path.exists(model1_path) or \
+                not model2_path or not os.path.exists(model2_path):
+            print("评估缺少必要的模型文件，跳过评估。")
             return
 
-        scores = {1: 0, -1: 0, 0: 0}
-        eval_args = {
+        model1_pt_path = model1_path.replace('.pth', '.pt')  # 旧模型
+        model2_pt_path = model2_path.replace('.pth', '.pt')  # 新模型
+        use_gpu = (device.type == 'cuda')
+
+        total_games = self.args.get('num_eval_games', 50)
+        games_per_side = total_games // 2
+        if games_per_side == 0:
+            print("评估局数过少，无法进行分组评估。")
+            return
+
+        print(f"评估模型 (旧): {model1_pt_path}")
+        print(f"评估模型 (新): {model2_pt_path}")
+
+        base_eval_args = {
+            'num_eval_games': games_per_side,
             'num_eval_simulations': self.args.get('num_eval_simulations', 20),
-            'board_size': self.args['board_size']
+            'num_cpu_threads': self.args.get('num_cpu_threads', 12)
         }
-        for i in tqdm.tqdm(range(self.args['num_eval_games']), desc="评估对战"):
-            p1 = model2 if i % 2 == 0 else model1
-            p2 = model1 if i % 2 == 0 else model2
-            winner = cpp_mcts_engine.play_game_for_eval(p1, p2, eval_args)
-            if winner == 1:
-                scores[1 if i % 2 == 0 else -1] += 1
-            elif winner == -1:
-                scores[-1 if i % 2 == 0 else 1] += 1
-            else:
-                scores[0] += 1
 
-        win_rate = scores[1] / self.args['num_eval_games'] if self.args['num_eval_games'] > 0 else 0
-        print("\n------ 评估结果 ------")
-        print(f"总对局数: {self.args['num_eval_games']}")
-        print(f"新模型 vs 旧模型 (胜/负/平): {scores[1]} / {scores[-1]} / {scores[0]}")
-        print(f"新模型胜率: {win_rate:.2%}")
-        if win_rate > self.args.get('eval_win_rate', 0.55):
-            print("结论：新模型有显著提升！👍")
+        # --- 实验一：新模型执先手 (Model 2) ---
+        print(f"\n[实验一] 新模型执黑，进行 {games_per_side} 局...")
+        results1 = cpp_mcts_engine.run_parallel_evaluation(
+            model1_pt_path, model2_pt_path, use_gpu, base_eval_args, mode=2
+        )
+        new_as_p1_wins = results1.get("model2_wins", 0)
+        old_as_p2_wins = results1.get("model1_wins", 0)
+        draws1 = results1.get("draws", 0)
+
+        # --- 实验二：旧模型执先手 (Model 1) ---
+        print(f"\n[实验二] 旧模型执黑，进行 {games_per_side} 局...")
+        results2 = cpp_mcts_engine.run_parallel_evaluation(
+            model1_pt_path, model2_pt_path, use_gpu, base_eval_args, mode=1
+        )
+        old_as_p1_wins = results2.get("model1_wins", 0)
+        new_as_p2_wins = results2.get("model2_wins", 0)
+        draws2 = results2.get("draws", 0)
+
+        # --- 汇总和分析结果 ---
+        total_new_wins = new_as_p1_wins + new_as_p2_wins
+        total_old_wins = old_as_p1_wins + old_as_p2_wins
+        total_draws = draws1 + draws2
+
+        print("\n------ 诊断评估结果 ------")
+        print(f"新模型执先手时，战绩 (新 vs 旧 | 胜/负/平): {new_as_p1_wins} / {old_as_p2_wins} / {draws1}")
+        print(f"旧模型执先手时，战绩 (旧 vs 新 | 胜/负/平): {old_as_p1_wins} / {new_as_p2_wins} / {draws2}")
+        print("---------------------------------")
+
+        overall_win_rate = total_new_wins / (total_games) if total_games > 0 else 0
+        print(f"综合战绩 - 新 vs 旧 (胜/负/平): {total_new_wins} / {total_old_wins} / {total_draws}")
+        print(f"新模型综合胜率: {overall_win_rate:.2%}")
+
+        if games_per_side > 0 and (new_as_p1_wins / games_per_side) > 0.9 and (old_as_p1_wins / games_per_side) > 0.9:
+            print("\n【诊断结论】: AI已发现并掌握了 '先手必胜' 策略。")
+            print("下一步建议：在自对弈中引入'狄利克雷噪声'和'温度采样'来打破僵局，探索后手获胜的可能性。")
+        elif overall_win_rate > self.args.get('eval_win_rate', 0.52):
+            print("\n【诊断结论】: 新模型有显著提升！👍")
         else:
-            print("结论：新模型提升不明显或没有提升。")
+            print("\n【诊断结论】: 新模型提升不明显或没有提升，可能陷入了局部最优。")
 
 
 if __name__ == '__main__':

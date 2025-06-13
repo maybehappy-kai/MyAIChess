@@ -15,6 +15,6 @@ args = {
     # 在config.py的args字典里任意位置加入这行
     'value_loss_weight': 0.25,
     # --- 评估体系参数 ---
-    'num_eval_games': 50,  # 最终评估时，新旧模型对战的局数
+    'num_eval_games': 320,  # 最终评估时，新旧模型对战的局数
     'board_size': 9,
 }
