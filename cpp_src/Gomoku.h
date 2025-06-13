@@ -17,6 +17,17 @@ public:
     Gomoku(int board_size = 9, int num_rounds = 25);
     void reset();
 
+    // ====================== 在这里新增构造函数声明 ======================
+        Gomoku(
+            int board_size,
+            int max_total_moves,
+            int current_player,
+            int current_move_number,
+            const std::vector<std::vector<int>>& board_pieces,
+            const std::vector<std::vector<int>>& board_territory
+        );
+        // ================================================================
+
     // 公有方法，复刻并优化后的游戏逻辑
     void execute_move(int action);
     std::vector<bool> get_valid_moves() const;

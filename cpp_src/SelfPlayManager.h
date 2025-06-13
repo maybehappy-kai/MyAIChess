@@ -83,3 +83,15 @@ py::dict run_parallel_evaluation(
     int mode // <-- 新增mode参数
 );
 // =============================================================
+
+// ====================== 新增单步决策函数的声明 ======================
+int find_best_action_for_state(
+    py::list board_pieces,
+    py::list board_territory,
+    int current_player,
+    int current_move_number,
+    const std::string& model_path,
+    bool use_gpu,
+    py::dict args
+);
+// =============================================================

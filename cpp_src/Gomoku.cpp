@@ -277,3 +277,21 @@ void Gomoku::print_board() const {
 int Gomoku::get_move_number() const {
     return current_move_number_;
 }
+
+// ====================== 在文件任意位置新增构造函数的实现 ======================
+Gomoku::Gomoku(
+    int board_size,
+    int max_total_moves,
+    int current_player,
+    int current_move_number,
+    const std::vector<std::vector<int>>& board_pieces,
+    const std::vector<std::vector<int>>& board_territory)
+    : board_size_(board_size),
+      max_total_moves_(max_total_moves),
+      current_player_(current_player),
+      current_move_number_(current_move_number),
+      board_pieces_(board_pieces),
+      board_territory_(board_territory) {
+    // 构造函数的函数体为空，因为所有工作都在初始化列表中完成了
+}
+// ===========================================================================

@@ -25,4 +25,17 @@ PYBIND11_MODULE(cpp_mcts_engine, m) {
           py::arg("args"), // <--- 确保这里有正确的括号和结尾
           py::arg("mode") // <-- 新增mode参数的绑定
     );
+
+    // ====================== 在这里新增绑定 ======================
+        m.def("find_best_action", &find_best_action_for_state,
+              "Finds the best action for a given board state using C++ MCTS engine.",
+              py::arg("board_pieces"),
+              py::arg("board_territory"),
+              py::arg("current_player"),
+              py::arg("current_move_number"),
+              py::arg("model_path"),
+              py::arg("use_gpu"),
+              py::arg("args")
+        );
+        // ========================================================
 }

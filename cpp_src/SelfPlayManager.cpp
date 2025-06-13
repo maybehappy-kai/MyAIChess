@@ -380,3 +380,104 @@ void EvaluationManager::worker_func(int worker_id) {
         }
     }
 }
+
+// ====================== 这是修正后的 find_best_action_for_state 函数 ======================
+
+int find_best_action_for_state(
+    py::list py_board_pieces,
+    py::list py_board_territory,
+    int current_player,
+    int current_move_number,
+    const std::string& model_path,
+    bool use_gpu,
+    py::dict args)
+{
+    py::gil_scoped_release release;
+    // 1. 从Python传入的数据重建C++对象
+    int board_size = args["board_size"].cast<int>();
+    int max_total_moves = args.contains("max_total_moves") ? args["max_total_moves"].cast<int>() : 50;
+
+    // 将 py::list 转换为 std::vector<std::vector<int>>
+    std::vector<std::vector<int>> pieces_vec;
+    for (auto r : py_board_pieces) {
+        pieces_vec.push_back(r.cast<std::vector<int>>());
+    }
+
+    std::vector<std::vector<int>> territory_vec;
+    for (auto r : py_board_territory) {
+        territory_vec.push_back(r.cast<std::vector<int>>());
+    }
+
+    // ★★★ 使用我们新增的构造函数来创建Gomoku对象 ★★★
+    Gomoku game(
+        board_size,
+        max_total_moves,
+        current_player,
+        current_move_number,
+        pieces_vec,
+        territory_vec
+    );
+
+    // 2. 加载一次性使用的推理引擎
+    auto engine = std::make_shared<InferenceEngine>(model_path, use_gpu);
+
+    // 3. 执行MCTS搜索 (这部分逻辑和之前一样，无需改动)
+    int num_simulations = args["num_searches"].cast<int>();
+    auto root = std::make_unique<Node>(game);
+
+    std::vector<Node*> leaves;
+    leaves.reserve(num_simulations);
+    for (int i = 0; i < num_simulations; ++i) {
+        Node* node = root.get();
+        while (node->is_fully_expanded()) {
+            node = node->select_child();
+        }
+        auto [end_value, is_terminal] = node->game_state_.get_game_ended();
+        double value_to_propagate = end_value;
+        if (is_terminal) {
+            value_to_propagate *= node->game_state_.get_current_player();
+            node->backpropagate(value_to_propagate);
+            continue;
+        }
+        leaves.push_back(node);
+    }
+
+    if (!leaves.empty()) {
+        std::sort(leaves.begin(), leaves.end());
+        leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
+        std::vector<std::vector<float>> state_batch;
+        state_batch.reserve(leaves.size());
+        for (const auto* leaf : leaves) {
+            state_batch.push_back(leaf->game_state_.get_state());
+        }
+        auto [policy_batch, value_batch] = engine->infer(state_batch);
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            Node* leaf = leaves[i];
+            leaf->expand(policy_batch[i]);
+            leaf->backpropagate(static_cast<double>(value_batch[i]));
+        }
+    }
+
+    // 4. 选择访问次数最多的动作作为最佳动作 (这部分逻辑和之前一样，无需改动)
+    int action = -1;
+    if (!root->children_.empty()) {
+        int max_visits = -1;
+        for (const auto& child : root->children_) {
+            if (child && child->visit_count_ > max_visits) {
+                max_visits = child->visit_count_;
+                action = child->action_taken_;
+            }
+        }
+    }
+
+    if (action == -1) {
+        auto valid_moves = game.get_valid_moves();
+        for (size_t i = 0; i < valid_moves.size(); ++i) {
+            if (valid_moves[i]) return i;
+        }
+    }
+
+    return action;
+}
+
+// =======================================================================================
