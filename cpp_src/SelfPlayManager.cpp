@@ -95,6 +95,35 @@ void SelfPlayManager::worker_func(int worker_id) {
             while (true) {
                 auto root = std::make_unique<Node>(game);
 
+                // vvvvvvvvvvvv 【新增代码：添加狄利克雷噪声】 vvvvvvvvvvvv
+                    // 仅在自我对弈时添加噪声，评估时不需要
+                    const float dirichlet_alpha = 0.3f; // 建议从Python的args传入
+                    if (!root->children_.empty()) {
+                        std::vector<float> dirichlet_noise;
+                        std::random_device rd;
+                        std::mt19937 gen(rd());
+                        // 为每个合法的子节点生成一个gamma分布的随机数
+                        std::gamma_distribution<float> gamma(dirichlet_alpha, 1.0f);
+                        for (size_t i = 0; i < root->children_.size(); ++i) {
+                            dirichlet_noise.push_back(gamma(gen));
+                        }
+
+                        // 归一化噪声
+                        float sum_noise = std::accumulate(dirichlet_noise.begin(), dirichlet_noise.end(), 0.0f);
+                        if (sum_noise > 0) {
+                            for (float& n : dirichlet_noise) {
+                                n /= sum_noise;
+                            }
+                        }
+
+                        // 将噪声混合到先验概率中 (通常75%的原策略 + 25%的噪声)
+                        const float noise_fraction = 0.25f;
+                        for (size_t i = 0; i < root->children_.size(); ++i) {
+                            root->children_[i]->prior_ = root->children_[i]->prior_ * (1.0f - noise_fraction) + dirichlet_noise[i] * noise_fraction;
+                        }
+                    }
+                    // ^^^^^^^^^^^^ 【新增代码结束】 ^^^^^^^^^^^^
+
                 std::vector<Node*> leaves;
                 leaves.reserve(num_simulations);
                 for (int i = 0; i < num_simulations; ++i) {
@@ -142,16 +171,36 @@ void SelfPlayManager::worker_func(int worker_id) {
                 }
                 episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
 
+                // vvvvvvvvvvvv 【核心修改区域】 vvvvvvvvvvvv
                 int action = -1;
-                if (!root->children_.empty()) {
-                    int max_visits = -1;
-                    for (const auto& child : root->children_) {
-                        if (child && child->visit_count_ > max_visits) {
-                            max_visits = child->visit_count_;
-                            action = child->action_taken_;
+                // 获取当前是第几步棋
+                const int move_number = game.get_move_number();
+
+                // 假设我们设置在游戏的前15步进行探索性采样
+                const int temperature_moves = 15;
+
+                if (move_number < temperature_moves) {
+                    // ---- 温度采样：根据概率分布随机选择 ----
+                    if (!action_probs.empty()) {
+                        std::random_device rd;
+                        std::mt19937 gen(rd());
+                        // action_probs 已经是归一化的概率分布
+                        std::discrete_distribution<> distrib(action_probs.begin(), action_probs.end());
+                        action = distrib(gen);
+                    }
+                } else {
+                    // ---- 确定性选择：选择访问次数最多的棋步 (你原来的逻辑) ----
+                    if (!root->children_.empty()) {
+                        int max_visits = -1;
+                        for (const auto& child : root->children_) {
+                            if (child && child->visit_count_ > max_visits) {
+                                max_visits = child->visit_count_;
+                                action = child->action_taken_;
+                            }
                         }
                     }
-                }
+
+                // ^^^^^^^^^^^^ 【核心修改区域结束】 ^^^^^^^^^^^^
                 if (action == -1) {
                     auto valid_moves = game.get_valid_moves();
                     std::vector<int> valid_move_indices;
