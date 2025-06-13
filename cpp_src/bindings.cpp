@@ -1,8 +1,8 @@
 ﻿// file: cpp_src/bindings.cpp (修正后)
 #include <pybind11/pybind11.h>
 #include "SelfPlayManager.h"
-#include "Gomoku.h" // <-- 新增
-#include <pybind11/stl.h> // <-- 新增，用于自动转换vector等
+//#include "Gomoku.h" // <-- 新增
+//#include <pybind11/stl.h> // <-- 新增，用于自动转换vector等
 
 
 namespace py = pybind11;
@@ -42,7 +42,7 @@ PYBIND11_MODULE(cpp_mcts_engine, m) {
         );
         // ========================================================
         // vvvvvvvvvvvv 【新增Gomoku类的绑定】 vvvvvvvvvvvv
-            py::class_<Gomoku>(m, "Gomoku")
+            /*py::class_<Gomoku>(m, "Gomoku")
                 .def(py::init<int, int>(), py::arg("board_size")=9, py::arg("num_rounds")=25)
                 .def("execute_move", &Gomoku::execute_move)
                 .def("get_valid_moves", &Gomoku::get_valid_moves)
@@ -61,6 +61,6 @@ PYBIND11_MODULE(cpp_mcts_engine, m) {
                 })
                 .def_property_readonly("board_territory", [](Gomoku &g){
                     return g.board_territory_; // 注意：这需要将 board_territory_ 设为 public
-                });
+                });*/
             // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 }

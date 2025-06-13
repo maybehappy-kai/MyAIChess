@@ -94,7 +94,7 @@ void SelfPlayManager::worker_func(int worker_id) {
 
             while (true) {
                 auto root = std::make_unique<Node>(game);
-
+/*
                 // vvvvvvvvvvvv 【新增代码：添加狄利克雷噪声】 vvvvvvvvvvvv
                     // 仅在自我对弈时添加噪声，评估时不需要
                     const float dirichlet_alpha = 0.3f; // 建议从Python的args传入
@@ -123,7 +123,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                         }
                     }
                     // ^^^^^^^^^^^^ 【新增代码结束】 ^^^^^^^^^^^^
-
+*/
                 std::vector<Node*> leaves;
                 leaves.reserve(num_simulations);
                 for (int i = 0; i < num_simulations; ++i) {
@@ -170,7 +170,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                     }
                 }
                 episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
-
+/*
                 // vvvvvvvvvvvv 【核心修改区域】 vvvvvvvvvvvv
                 int action = -1;
                 // 获取当前是第几步棋
@@ -201,6 +201,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                     }
 
                 // ^^^^^^^^^^^^ 【核心修改区域结束】 ^^^^^^^^^^^^
+                */
                 if (action == -1) {
                     auto valid_moves = game.get_valid_moves();
                     std::vector<int> valid_move_indices;
