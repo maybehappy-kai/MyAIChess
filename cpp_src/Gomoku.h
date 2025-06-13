@@ -9,6 +9,8 @@
 
 class Gomoku {
 public:
+std::vector<std::vector<int>> get_board_pieces() const; // 新增
+    std::vector<std::vector<int>> get_board_territory() const; // 新增
     // 静态常量，用于定义棋盘状态
     static constexpr int EMPTY_SLOT = 0;
     static constexpr int PLAYER_BLACK = 1;

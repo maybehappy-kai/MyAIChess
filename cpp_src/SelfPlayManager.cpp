@@ -1,4 +1,5 @@
 // file: cpp_src/SelfPlayManager.cpp (完全修正版)
+#define NOMINMAX
 #include <pybind11/stl.h>
 #include <memory>
 #include <mutex>
@@ -94,7 +95,7 @@ void SelfPlayManager::worker_func(int worker_id) {
 
             while (true) {
                 auto root = std::make_unique<Node>(game);
-/*
+
                 // vvvvvvvvvvvv 【新增代码：添加狄利克雷噪声】 vvvvvvvvvvvv
                     // 仅在自我对弈时添加噪声，评估时不需要
                     const float dirichlet_alpha = 0.3f; // 建议从Python的args传入
@@ -123,7 +124,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                         }
                     }
                     // ^^^^^^^^^^^^ 【新增代码结束】 ^^^^^^^^^^^^
-*/
+
                 std::vector<Node*> leaves;
                 leaves.reserve(num_simulations);
                 for (int i = 0; i < num_simulations; ++i) {
@@ -170,7 +171,8 @@ void SelfPlayManager::worker_func(int worker_id) {
                     }
                 }
                 episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
-/*
+                //int action = -1;
+
                 // vvvvvvvvvvvv 【核心修改区域】 vvvvvvvvvvvv
                 int action = -1;
                 // 获取当前是第几步棋
@@ -189,6 +191,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                         action = distrib(gen);
                     }
                 } else {
+
                     // ---- 确定性选择：选择访问次数最多的棋步 (你原来的逻辑) ----
                     if (!root->children_.empty()) {
                         int max_visits = -1;
@@ -199,9 +202,10 @@ void SelfPlayManager::worker_func(int worker_id) {
                             }
                         }
                     }
+                }
 
                 // ^^^^^^^^^^^^ 【核心修改区域结束】 ^^^^^^^^^^^^
-                */
+
                 if (action == -1) {
                     auto valid_moves = game.get_valid_moves();
                     std::vector<int> valid_move_indices;
@@ -410,11 +414,11 @@ void EvaluationManager::worker_func(int worker_id) {
                     // 关键：我们要记录的是 model1 和 model2 的胜负
                     // winner_code = 1 代表 model1 胜, -1 代表 model2 胜
                     if (winner_result == 1) { // 如果 P1 胜了
-                        // 检查P1是哪个模型
-                        winner_code = (&p1_engine == &engine1_) ? 1 : -1;
+                        // 检查P1是哪个模型 (修正：使用 .get() 比较指针地址)
+                        winner_code = (p1_engine.get() == engine1_.get()) ? 1 : -1;
                     } else { // 如果 P2 胜了
-                        // 检查P2是哪个模型
-                        winner_code = (&p2_engine == &engine1_) ? 1 : -1;
+                        // 检查P2是哪个模型 (修正：使用 .get() 比较指针地址)
+                        winner_code = (p2_engine.get() == engine1_.get()) ? 1 : -1;
                     }
                 }
 

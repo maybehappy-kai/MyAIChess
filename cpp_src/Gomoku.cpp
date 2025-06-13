@@ -295,3 +295,15 @@ Gomoku::Gomoku(
     // 构造函数的函数体为空，因为所有工作都在初始化列表中完成了
 }
 // ===========================================================================
+// cpp_src/Gomoku.cpp
+
+// ... 文件已有的内容 ...
+
+// vvvvv 新增下面的函数实现 vvvvv
+std::vector<std::vector<int>> Gomoku::get_board_pieces() const {
+    return board_pieces_;
+}
+
+std::vector<std::vector<int>> Gomoku::get_board_territory() const {
+    return board_territory_;
+}

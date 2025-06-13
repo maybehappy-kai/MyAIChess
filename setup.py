@@ -1,8 +1,16 @@
-# file: setup.py
+# file: setup.py (修正版)
 from setuptools import setup, Extension
 import torch.utils.cpp_extension
 import sys
 import os
+import shutil
+
+# --- 清理旧的构建目录 ---
+build_dir = "build"
+if os.path.exists(build_dir):
+    print(f"正在清理旧的构建目录: {build_dir}")
+    shutil.rmtree(build_dir)
+# --------------------------
 
 # --- Python环境信息部分保持不变 ---
 py_major = sys.version_info.major
@@ -15,15 +23,16 @@ ext_modules = [
     torch.utils.cpp_extension.CppExtension(
         'cpp_mcts_engine',
         [
-            # 确保列表中的每个文件都是一个独立的字符串
             'cpp_src/bindings.cpp',
             'cpp_src/SelfPlayManager.cpp',
             'cpp_src/Gomoku.cpp',
             'cpp_src/Node.cpp',
-            'cpp_src/InferenceEngine.cpp'  # <--- 这一行很可能是您出错的地方，请确保它和上一行有逗号隔开
+            'cpp_src/InferenceEngine.cpp'
         ],
         extra_compile_args={
-            'cxx': ['/Zi', '/Od', '/FS'],
+            # 在Windows (MSVC)下, 使用'/std:c++17'来指定C++标准
+            # '/Zi' 用于生成调试信息, '/Od' 用于关闭优化, '/FS' 是VS中的一个标准标志
+            'cxx': ['/Zi', '/Od', '/FS', '/std:c++17'],
         },
         extra_link_args=[
             '/DEBUG',
