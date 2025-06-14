@@ -1,4 +1,4 @@
-﻿// file: cpp_src/bindings.cpp (修正后)
+﻿﻿// file: cpp_src/bindings.cpp (修正后)
 #include <pybind11/pybind11.h>
 #include "SelfPlayManager.h"
 #include "Gomoku.h" // <-- 新增
