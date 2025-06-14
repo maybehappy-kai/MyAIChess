@@ -23,7 +23,7 @@ def find_latest_model_file():
     return latest_file
 
 
-'''class PythonGomoku:
+class PythonGomoku:
     def __init__(self, board_size=9, num_rounds=25):
         self.board_size = board_size;
         self.max_total_moves = num_rounds * 2;
@@ -88,7 +88,7 @@ def find_latest_model_file():
             p2_score = sum(row.count(-1) for row in self.board_territory)
             return p1_score, p2_score, True
         return sum(row.count(1) for row in self.board_territory), sum(
-            row.count(-1) for row in self.board_territory), False'''
+            row.count(-1) for row in self.board_territory), False
 
 
 class Particle:
@@ -133,8 +133,7 @@ class GameGUI:
             self.font_medium = pygame.font.Font(None, 32);
             self.font_small = pygame.font.Font(None, 22)
         self.clock = pygame.time.Clock()
-        #self.game = PythonGomoku()
-        self.game = cpp_mcts_engine.Gomoku()  # <-- 使用C++版本
+        self.game = PythonGomoku()
         self.particles = []
         self.human_player = 1
         self.model_file = find_latest_model_file()
@@ -243,7 +242,7 @@ class GameGUI:
                 if valid:
                     r, c = self.ai_result_action // self.game.board_size, self.ai_result_action % self.game.board_size
                     pos = (
-                        BOARD_START_X + c * CELL_SIZE + CELL_SIZE // 2, BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
+                    BOARD_START_X + c * CELL_SIZE + CELL_SIZE // 2, BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
                     self.create_effect(pos, 30, (200, 200, 255), 'burst')  # AI落子特效颜色
                     if line_centers:
                         # ★★★ 核心修正 2：根据实际移动的玩家决定粒子颜色 ★★★

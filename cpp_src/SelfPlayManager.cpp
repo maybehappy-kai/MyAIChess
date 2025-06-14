@@ -1,5 +1,4 @@
 // file: cpp_src/SelfPlayManager.cpp (完全修正版)
-#define NOMINMAX
 #include <pybind11/stl.h>
 #include <memory>
 #include <mutex>
@@ -75,7 +74,6 @@ void SelfPlayManager::run() {
     }
 }
 
-// 【请用下面的完整函数替换你文件中旧的 worker_func】
 void SelfPlayManager::worker_func(int worker_id) {
     while (true) {
         int game_idx;
@@ -86,7 +84,12 @@ void SelfPlayManager::worker_func(int worker_id) {
         try {
             Gomoku game;
             std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
+
+            // ====================== 核心修正区域：工作函数 ======================
+            // 直接使用C++成员变量，不再访问Python字典
             const int num_simulations = this->num_simulations_;
+            // ===============================================================
+
             const int action_size = game.get_board_size() * game.get_board_size();
 
             while (true) {
@@ -125,57 +128,36 @@ void SelfPlayManager::worker_func(int worker_id) {
                     }
                 }
 
-                // --- 动作选择逻辑 ---
-                int action = -1;
                 std::vector<float> action_probs(action_size, 0.0f);
-
-                // 1. 计算基于访问次数的概率分布和总访问次数
-                float sum_visits = 0.0f;
                 if (!root->children_.empty()) {
                     for (const auto& child : root->children_) {
                         if (child && child->action_taken_ >= 0 && child->action_taken_ < action_size) {
                             action_probs[child->action_taken_] = static_cast<float>(child->visit_count_);
-                            sum_visits += child->visit_count_;
                         }
                     }
+                    float sum_visits = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
                     if (sum_visits > 0) {
-                        for (float& p : action_probs) {
-                            p /= sum_visits;
-                        }
+                        for (float& p : action_probs) { p /= sum_visits; }
                     }
                 }
                 episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
 
-                // 2. 根据温度采样或确定性选择来决定动作
-                if (sum_visits > 0) {
-                    const int move_number = game.get_move_number();
-                    const int temperature_moves = 15;
-
-                    if (move_number < temperature_moves) {
-                        // 温度采样
-                        std::random_device rd;
-                        std::mt19937 gen(rd());
-                        std::discrete_distribution<> distrib(action_probs.begin(), action_probs.end());
-                        action = distrib(gen);
-                    } else {
-                        // 确定性选择 (选择访问次数最多的)
-                        float max_prob = -1.0f;
-                        for (size_t i = 0; i < action_probs.size(); ++i) {
-                            if (action_probs[i] > max_prob) {
-                                max_prob = action_probs[i];
-                                action = i;
-                            }
+                int action = -1;
+                if (!root->children_.empty()) {
+                    int max_visits = -1;
+                    for (const auto& child : root->children_) {
+                        if (child && child->visit_count_ > max_visits) {
+                            max_visits = child->visit_count_;
+                            action = child->action_taken_;
                         }
                     }
                 }
-
-                // 3. 如果MCTS后依然没有选出动作，则进行安全的回退
                 if (action == -1) {
                     auto valid_moves = game.get_valid_moves();
                     std::vector<int> valid_move_indices;
                     for (size_t i = 0; i < valid_moves.size(); ++i) {
                         if (valid_moves[i]) {
-                            valid_move_indices.push_back(static_cast<int>(i));
+                            valid_move_indices.push_back(i);
                         }
                     }
                     if (!valid_move_indices.empty()) {
@@ -187,7 +169,6 @@ void SelfPlayManager::worker_func(int worker_id) {
                         break;
                     }
                 }
-
                 game.execute_move(action);
 
                 auto [final_value, is_done] = game.get_game_ended();
@@ -379,11 +360,11 @@ void EvaluationManager::worker_func(int worker_id) {
                     // 关键：我们要记录的是 model1 和 model2 的胜负
                     // winner_code = 1 代表 model1 胜, -1 代表 model2 胜
                     if (winner_result == 1) { // 如果 P1 胜了
-                        // 检查P1是哪个模型 (修正：使用 .get() 比较指针地址)
-                        winner_code = (p1_engine.get() == engine1_.get()) ? 1 : -1;
+                        // 检查P1是哪个模型
+                        winner_code = (&p1_engine == &engine1_) ? 1 : -1;
                     } else { // 如果 P2 胜了
-                        // 检查P2是哪个模型 (修正：使用 .get() 比较指针地址)
-                        winner_code = (p2_engine.get() == engine1_.get()) ? 1 : -1;
+                        // 检查P2是哪个模型
+                        winner_code = (&p2_engine == &engine1_) ? 1 : -1;
                     }
                 }
 

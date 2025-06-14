@@ -1,9 +1,6 @@
-﻿﻿// file: cpp_src/bindings.cpp (修正后)
+﻿// file: cpp_src/bindings.cpp (修正后)
 #include <pybind11/pybind11.h>
 #include "SelfPlayManager.h"
-#include "Gomoku.h" // <-- 新增
-#include <pybind11/stl.h> // <-- 新增，用于自动转换vector等
-
 
 namespace py = pybind11;
 
@@ -41,20 +38,4 @@ PYBIND11_MODULE(cpp_mcts_engine, m) {
               py::arg("args")
         );
         // ========================================================
-        // vvvvvvvvvvvv 【新增Gomoku类的绑定】 vvvvvvvvvvvv
-            py::class_<Gomoku>(m, "Gomoku")
-                .def(py::init<int, int>(), py::arg("board_size")=9, py::arg("num_rounds")=25)
-                .def("execute_move", &Gomoku::execute_move)
-                .def("get_valid_moves", &Gomoku::get_valid_moves)
-                .def("get_game_ended", &Gomoku::get_game_ended)
-                .def("get_state", &Gomoku::get_state)
-                .def("get_current_player", &Gomoku::get_current_player)
-                .def("get_board_size", &Gomoku::get_board_size)
-                .def("get_move_number", &Gomoku::get_move_number)
-                .def("print_board", &Gomoku::print_board)
-                .def("reset", &Gomoku::reset)
-                // 如果需要从Python访问棋盘状态，可以添加只读属性
-                .def_property_readonly("board_pieces", &Gomoku::get_board_pieces)
-                    .def_property_readonly("board_territory", &Gomoku::get_board_territory);
-            // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 }
