@@ -1,5 +1,5 @@
-import torch
 import pygame
+import torch
 import sys
 import os
 import re
@@ -8,10 +8,12 @@ from config import args
 import random
 import math
 import threading
+import copy
+import queue  # ★★★ 新增：导入线程安全的队列模块 ★★★
 
 
 def find_latest_model_file():
-    path = "."
+    path = ".";
     max_epoch = -1;
     latest_file = None
     pattern = re.compile(r"model_(\d+)\.pt")
@@ -46,9 +48,9 @@ class PythonGomoku:
         return valid_moves
 
     def execute_move(self, action):
-        if not self.get_valid_moves(): return False, []
+        if not self.get_valid_moves(): return False, [], 0
         r, c = action // self.board_size, action % self.board_size
-        player_who_moved = self.current_player  # 记录下是哪个玩家移动的
+        player_who_moved = self.current_player
         self.board_pieces[r][c] = player_who_moved;
         self.last_move = (r, c);
         pieces_to_remove = set();
@@ -67,7 +69,7 @@ class PythonGomoku:
                 line_centers.append(points[1])
         if pieces_to_remove:
             for pr, pc in pieces_to_remove: self.board_pieces[pr][pc] = 0
-            directions = [(0, 1), (1, 0), (1, 1), (-1, 1)]
+            directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
             for i in range(4):
                 if axis_found[i]:
                     dr, dc = directions[i]
@@ -96,7 +98,7 @@ class Particle:
         self.x = x;
         self.y = y;
         self.color = color;
-        self.life = life
+        self.life = life;
         self.max_life = life;
         self.size = size
         self.vx = math.cos(angle) * speed;
@@ -112,7 +114,7 @@ class Particle:
         if self.life > 0:
             alpha = int(255 * max(0, self.life / self.max_life))
             current_color = self.color + (alpha,)
-            s = pygame.Surface((self.size, self.size), pygame.SRCALPHA)
+            s = pygame.Surface((self.size, self.size), pygame.SRCALPHA);
             s.fill(current_color)
             screen.blit(s, (self.x - self.size / 2, self.y - self.size / 2))
 
@@ -122,13 +124,14 @@ class GameGUI:
         pygame.init()
         self.screen_size = (960, 720)
         self.screen = pygame.display.set_mode(self.screen_size)
-        pygame.display.set_caption("MyAIChess - 先行体验版 (v5)")
+        pygame.display.set_caption("MyAIChess - 稳定最终版")
         self.font_path = "C:\Windows\Fonts\simhei.ttf"
         try:
             self.font_big = pygame.font.Font(self.font_path, 48);
             self.font_medium = pygame.font.Font(self.font_path, 32);
             self.font_small = pygame.font.Font(self.font_path, 22)
         except FileNotFoundError:
+            print(f"警告：字体文件 {self.font_path} 未找到！");
             self.font_big = pygame.font.Font(None, 48);
             self.font_medium = pygame.font.Font(None, 32);
             self.font_small = pygame.font.Font(None, 22)
@@ -140,8 +143,10 @@ class GameGUI:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.colors = {'p1': (220, 50, 120), 'p2': (50, 200, 120), 'background': (25, 25, 40),
                        'grid_line': (40, 40, 60), 'territory1': (200, 0, 100, 100), 'territory2': (0, 200, 100, 100)}
-        self.ai_is_thinking = False
-        self.ai_result_action = None
+
+        # ★★★ 核心修正 1：不再需要锁和共享状态，改用队列 ★★★
+        self.ai_result_queue = queue.Queue()
+        self.ai_is_thinking = False  # 这个标志现在只由主线程管理
 
     def draw_placeholder_piece(self, surface, player, center, radius, color=None):
         if color is None: color = self.colors['p1'] if player == 1 else self.colors['p2']
@@ -166,6 +171,7 @@ class GameGUI:
             self.particles.append(Particle(position[0], position[1], color, life, angle, speed, size))
 
     def draw_game_scene(self):
+        # ... 此函数内容保持不变 ...
         CELL_SIZE = 60
         BOARD_START_X = (self.screen_size[0] - self.game.board_size * CELL_SIZE) // 2
         BOARD_START_Y = (self.screen_size[1] - self.game.board_size * CELL_SIZE) // 2
@@ -183,8 +189,7 @@ class GameGUI:
                     self.draw_placeholder_piece(self.screen, territory, rect.center, CELL_SIZE // 4,
                                                 self.colors['background'])
                 piece = self.game.board_pieces[r][c]
-                if piece != 0:
-                    self.draw_placeholder_piece(self.screen, piece, rect.center, CELL_SIZE // 2 - 8)
+                if piece != 0: self.draw_placeholder_piece(self.screen, piece, rect.center, CELL_SIZE // 2 - 8)
         self.particles = [p for p in self.particles if p.update()]
         for p in self.particles: p.draw(self.screen)
         p1_score, p2_score, _ = self.game.check_game_end()
@@ -198,30 +203,53 @@ class GameGUI:
         p2_text = self.font_big.render(f"{p2_score}", True, self.colors['p2']);
         self.screen.blit(p2_text, (self.screen_size[0] - 80 - p2_text.get_width(), 200))
 
-    def _ai_worker_func(self):
+    # ★★★ 核心修正 2：AI工作函数现在只负责计算和把结果“投递”到邮箱 ★★★
+    def _ai_worker_func(self, board_pieces, board_territory, current_player, current_move_number):
         ai_args = {'board_size': self.game.board_size, 'num_searches': args.get('num_searches', 400),
                    'max_total_moves': self.game.max_total_moves}
-        best_action = cpp_mcts_engine.find_best_action(self.game.board_pieces, self.game.board_territory,
-                                                       self.game.current_player, self.game.current_move_number,
-                                                       self.model_file, self.device.type == 'cuda', ai_args)
-        self.ai_result_action = best_action
-        self.ai_is_thinking = False
+        best_action = cpp_mcts_engine.find_best_action(board_pieces, board_territory, current_player,
+                                                       current_move_number, self.model_file, self.device.type == 'cuda',
+                                                       ai_args)
+        self.ai_result_queue.put(best_action)
 
     def run(self):
         CELL_SIZE = 60
         BOARD_START_X = (self.screen_size[0] - self.game.board_size * CELL_SIZE) // 2
         BOARD_START_Y = (self.screen_size[1] - self.game.board_size * CELL_SIZE) // 2
-        running = True
+        running = True;
         game_over = False
 
         while running:
+            # ★★★ 核心修正 3：重构主循环，使用队列通信 ★★★
+
+            # 1. 检查邮箱，看AI是否已经把结果送回来了
+            try:
+                ai_action = self.ai_result_queue.get_nowait()
+                # 如果能取到东西，说明AI思考完了
+                valid, line_centers, player_who_moved = self.game.execute_move(ai_action)
+                if valid:
+                    r, c = ai_action // self.game.board_size, ai_action % self.game.board_size
+                    pos = (
+                    BOARD_START_X + c * CELL_SIZE + CELL_SIZE // 2, BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
+                    self.create_effect(pos, 30, (200, 200, 255), 'burst')
+                    if line_centers:
+                        line_color = self.colors['p1'] if player_who_moved == 1 else self.colors['p2']
+                        for lr, lc in line_centers:
+                            l_pos = (BOARD_START_X + lc * CELL_SIZE + CELL_SIZE // 2,
+                                     BOARD_START_Y + lr * CELL_SIZE + CELL_SIZE // 2)
+                            self.create_effect(l_pos, 50, line_color, 'line')
+                self.ai_is_thinking = False  # AI执行完毕，标记为空闲
+            except queue.Empty:
+                # 邮箱是空的，这是正常情况，什么都不用做
+                pass
+
+            # 2. 处理用户输入
             is_human_turn = (self.game.current_player == self.human_player and not game_over)
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                if is_human_turn and event.type == pygame.MOUSEBUTTONDOWN:
+                if event.type == pygame.QUIT: running = False
+                if is_human_turn and not self.ai_is_thinking and event.type == pygame.MOUSEBUTTONDOWN:
                     x, y = event.pos
-                    c = (x - BOARD_START_X) // CELL_SIZE
+                    c = (x - BOARD_START_X) // CELL_SIZE;
                     r = (y - BOARD_START_Y) // CELL_SIZE
                     if 0 <= r < self.game.board_size and 0 <= c < self.game.board_size:
                         action = r * self.game.board_size + c
@@ -229,40 +257,30 @@ class GameGUI:
                         if valid:
                             pos = (BOARD_START_X + c * CELL_SIZE + CELL_SIZE // 2,
                                    BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
-                            self.create_effect(pos, 30, (255, 255, 200), 'burst')  # 落子特效颜色
+                            self.create_effect(pos, 30, (255, 255, 200), 'burst')
                             if line_centers:
-                                # ★★★ 核心修正 1：根据实际移动的玩家决定粒子颜色 ★★★
                                 line_color = self.colors['p1'] if player_who_moved == 1 else self.colors['p2']
                                 for lr, lc in line_centers:
                                     l_pos = (BOARD_START_X + lc * CELL_SIZE + CELL_SIZE // 2,
                                              BOARD_START_Y + lr * CELL_SIZE + CELL_SIZE // 2)
                                     self.create_effect(l_pos, 50, line_color, 'line')
-            if self.ai_result_action is not None:
-                valid, line_centers, player_who_moved = self.game.execute_move(self.ai_result_action)
-                if valid:
-                    r, c = self.ai_result_action // self.game.board_size, self.ai_result_action % self.game.board_size
-                    pos = (
-                    BOARD_START_X + c * CELL_SIZE + CELL_SIZE // 2, BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
-                    self.create_effect(pos, 30, (200, 200, 255), 'burst')  # AI落子特效颜色
-                    if line_centers:
-                        # ★★★ 核心修正 2：根据实际移动的玩家决定粒子颜色 ★★★
-                        line_color = self.colors['p1'] if player_who_moved == 1 else self.colors['p2']
-                        for lr, lc in line_centers:
-                            l_pos = (BOARD_START_X + lc * CELL_SIZE + CELL_SIZE // 2,
-                                     BOARD_START_Y + lr * CELL_SIZE + CELL_SIZE // 2)
-                            self.create_effect(l_pos, 50, line_color, 'line')
-                self.ai_result_action = None
-            is_ai_turn = (self.game.current_player != self.human_player and not game_over)
-            if is_ai_turn and not self.ai_is_thinking:
-                self.ai_is_thinking = True
-                ai_thread = threading.Thread(target=self._ai_worker_func, daemon=True)
-                ai_thread.start()
-            self.draw_game_scene()
 
-            # ★★★ 核心修正 3：删除这部分代码 ★★★
-            # if self.ai_is_thinking:
-            #     thinking_text = self.font_medium.render("AI 正在思考...", True, (255, 255, 100))
-            #     self.screen.blit(thinking_text, (self.screen_size[0] // 2 - thinking_text.get_width() // 2, self.screen_size[1] - 50))
+            # 3. 检查是否需要启动AI线程
+            is_ai_turn_to_start = (
+                        self.game.current_player != self.human_player and not game_over and not self.ai_is_thinking)
+            if is_ai_turn_to_start:
+                self.ai_is_thinking = True
+                thread_args = (copy.deepcopy(self.game.board_pieces), copy.deepcopy(self.game.board_territory),
+                               self.game.current_player, self.game.current_move_number)
+                ai_thread = threading.Thread(target=self._ai_worker_func, args=thread_args, daemon=True)
+                ai_thread.start()
+
+            # 4. 绘制所有内容
+            self.draw_game_scene()
+            if self.ai_is_thinking:
+                thinking_text = self.font_medium.render("AI 正在思考...", True, (255, 255, 100))
+                self.screen.blit(thinking_text,
+                                 (self.screen_size[0] - thinking_text.get_width() - 20, self.screen_size[1] - 50))
 
             if not game_over:
                 p1_score, p2_score, is_ended = self.game.check_game_end()
@@ -273,6 +291,7 @@ class GameGUI:
                         winner_text = "粉方 获胜!"
                     elif p2_score > p1_score:
                         winner_text = "绿方 获胜!"
+
             if game_over:
                 s = pygame.Surface(self.screen_size, pygame.SRCALPHA);
                 s.fill((0, 0, 0, 180));

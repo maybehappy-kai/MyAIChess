@@ -16,6 +16,22 @@
 #include <algorithm>
 #include <atomic>
 
+// ======================= 新增的、仅供人机对战使用的引擎缓存 =======================
+// 用于存储已经加载的模型，避免在对战中重复从硬盘读取
+static std::mutex g_engine_mutex;
+static std::map<std::string, std::shared_ptr<InferenceEngine>> g_engines;
+
+// 一个辅助函数，用于获取一个缓存的或新加载的引擎实例
+std::shared_ptr<InferenceEngine> get_cached_engine(const std::string& model_path, bool use_gpu) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    if (g_engines.find(model_path) == g_engines.end()) {
+        std::cout << "[C++ Engine Cache] Caching new model for interactive play: " << model_path << std::endl;
+        g_engines[model_path] = std::make_shared<InferenceEngine>(model_path, use_gpu);
+    }
+    return g_engines[model_path];
+}
+// ==============================================================================
+
 std::mutex g_io_mutex;
 std::atomic<long long> g_request_id_counter(0);
 
@@ -381,8 +397,7 @@ void EvaluationManager::worker_func(int worker_id) {
     }
 }
 
-// ====================== 这是修正后的 find_best_action_for_state 函数 ======================
-
+// 这是修正后的 find_best_action_for_state 函数
 int find_best_action_for_state(
     py::list py_board_pieces,
     py::list py_board_territory,
@@ -393,22 +408,24 @@ int find_best_action_for_state(
     py::dict args)
 {
     py::gil_scoped_release release;
-    // 1. 从Python传入的数据重建C++对象
+
+    // ★★★ 核心修正：不再直接创建新引擎，而是从我们专用的缓存中获取 ★★★
+    auto engine = get_cached_engine(model_path, use_gpu);
+
+    // --- 后续所有逻辑与您提供的版本完全相同，保持不变 ---
+
     int board_size = args["board_size"].cast<int>();
     int max_total_moves = args.contains("max_total_moves") ? args["max_total_moves"].cast<int>() : 50;
 
-    // 将 py::list 转换为 std::vector<std::vector<int>>
     std::vector<std::vector<int>> pieces_vec;
     for (auto r : py_board_pieces) {
         pieces_vec.push_back(r.cast<std::vector<int>>());
     }
-
     std::vector<std::vector<int>> territory_vec;
     for (auto r : py_board_territory) {
         territory_vec.push_back(r.cast<std::vector<int>>());
     }
 
-    // ★★★ 使用我们新增的构造函数来创建Gomoku对象 ★★★
     Gomoku game(
         board_size,
         max_total_moves,
@@ -418,10 +435,6 @@ int find_best_action_for_state(
         territory_vec
     );
 
-    // 2. 加载一次性使用的推理引擎
-    auto engine = std::make_shared<InferenceEngine>(model_path, use_gpu);
-
-    // 3. 执行MCTS搜索 (这部分逻辑和之前一样，无需改动)
     int num_simulations = args["num_searches"].cast<int>();
     auto root = std::make_unique<Node>(game);
 
@@ -458,7 +471,6 @@ int find_best_action_for_state(
         }
     }
 
-    // 4. 选择访问次数最多的动作作为最佳动作 (这部分逻辑和之前一样，无需改动)
     int action = -1;
     if (!root->children_.empty()) {
         int max_visits = -1;
@@ -479,5 +491,3 @@ int find_best_action_for_state(
 
     return action;
 }
-
-// =======================================================================================
