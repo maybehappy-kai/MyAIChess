@@ -126,7 +126,12 @@ class Coach:
             cpp_args = {
                 'num_selfPlay_episodes': self.args['num_selfPlay_episodes'],
                 'num_cpu_threads': self.args['num_cpu_threads'],
-                'num_searches': self.args['num_searches']
+                'num_searches': self.args['num_searches'],
+                'dirichlet_alpha': self.args['dirichlet_alpha'],  # <--- 【新增此行】
+                'dirichlet_epsilon': self.args['dirichlet_epsilon'],  # <--- 【新增此行】
+                'temperature_start': self.args['temperature_start'],  # <--- 【新增此行】
+                'temperature_end': self.args['temperature_end'],  # <--- 【新增此行】
+                'temperature_decay_moves': self.args['temperature_decay_moves']  # <--- 【新增此行】
             }
 
             # 【修改】获取前一轮的模型路径，而不是当前轮次的

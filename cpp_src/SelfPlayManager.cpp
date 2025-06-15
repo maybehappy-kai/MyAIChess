@@ -35,6 +35,60 @@ std::shared_ptr<InferenceEngine> get_cached_engine(const std::string& model_path
 std::mutex g_io_mutex;
 std::atomic<long long> g_request_id_counter(0);
 
+// ====================== 【新增】狄利克雷噪声辅助函数 ======================
+// 在文件靠前的位置 (例如，在 g_io_mutex 定义后) 添加这个函数
+void add_dirichlet_noise(
+    std::vector<float>& policy,
+    const std::vector<bool>& valid_moves,
+    double alpha,
+    double epsilon)
+{
+    // 使用 thread_local 确保每个工作线程拥有自己独立的、线程安全的随机数生成器
+    static thread_local std::mt19937 generator(std::random_device{}());
+
+    // 统计有多少个合法走法
+    int num_valid_moves = 0;
+    for (bool valid : valid_moves) {
+        if (valid) {
+            num_valid_moves++;
+        }
+    }
+    // 如果合法走法少于2个，添加噪声没有意义
+    if (num_valid_moves <= 1) return;
+
+    // 为每个合法走法从伽马分布中采样一个值
+    std::vector<float> noise_values;
+    noise_values.reserve(num_valid_moves);
+    std::gamma_distribution<float> gamma(alpha, 1.0f);
+    float sum_of_noise = 0.0f;
+
+    for (size_t i = 0; i < valid_moves.size(); ++i) {
+        if (valid_moves[i]) {
+            float noise = gamma(generator);
+            noise_values.push_back(noise);
+            sum_of_noise += noise;
+        }
+    }
+
+    // 归一化伽马分布的采样值，得到最终的狄利克雷噪声
+    if (sum_of_noise > 0.0f) {
+        for (float& n : noise_values) {
+            n /= sum_of_noise;
+        }
+    }
+
+    // 将噪声混合进原始策略中
+    int noise_idx = 0;
+    for (size_t i = 0; i < policy.size(); ++i) {
+        if (valid_moves[i]) {
+            policy[i] = (1.0f - epsilon) * policy[i] + epsilon * noise_values[noise_idx];
+            noise_idx++;
+        }
+    }
+}
+// ===========================================================================
+
+
 // Python调用的顶层函数
 void run_parallel_self_play(const std::string& model_path, bool use_gpu, py::object final_data_queue, py::dict args) {
     auto engine = std::make_shared<InferenceEngine>(model_path, use_gpu);
@@ -60,6 +114,12 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
     this->num_total_games_ = args["num_selfPlay_episodes"].cast<int>();
     this->num_workers_ = args["num_cpu_threads"].cast<int>();
     this->num_simulations_ = args["num_searches"].cast<int>();
+    this->dirichlet_alpha_ = args["dirichlet_alpha"].cast<double>();
+        this->dirichlet_epsilon_ = args["dirichlet_epsilon"].cast<double>();
+         // 【新增】从Python字典中获取温度参数
+            this->temperature_start_ = args["temperature_start"].cast<double>();
+            this->temperature_end_ = args["temperature_end"].cast<double>();
+            this->temperature_decay_moves_ = args["temperature_decay_moves"].cast<int>();
 }
 // ===============================================================
 
@@ -137,11 +197,27 @@ void SelfPlayManager::worker_func(int worker_id) {
                         state_batch.push_back(leaf->game_state_.get_state());
                     }
                     auto [policy_batch, value_batch] = engine_->infer(state_batch);
-                    for (size_t i = 0; i < leaves.size(); ++i) {
-                        Node* leaf = leaves[i];
-                        leaf->expand(policy_batch[i]);
-                        leaf->backpropagate(static_cast<double>(value_batch[i]));
-                    }
+                    // ===================【核心修改：应用噪声】===================
+                                        for (size_t i = 0; i < leaves.size(); ++i) {
+                                            Node* leaf = leaves[i];
+                                            auto current_policy = policy_batch[i]; // 拷贝一份策略
+
+                                            // 检查当前节点是否为MCTS搜索树的根节点 (只有根节点没有父节点)
+                                            if (leaf->parent_ == nullptr) {
+                                                // 是根节点，对其策略添加狄利克雷噪声
+                                                add_dirichlet_noise(
+                                                    current_policy, // 传入引用，函数内部会直接修改它
+                                                    leaf->game_state_.get_valid_moves(),
+                                                    this->dirichlet_alpha_,
+                                                    this->dirichlet_epsilon_
+                                                );
+                                            }
+
+                                            // 使用原始策略或加噪后的策略来扩展节点
+                                            leaf->expand(current_policy);
+                                            leaf->backpropagate(static_cast<double>(value_batch[i]));
+                                        }
+                                        // ==========================================================
                 }
 
                 std::vector<float> action_probs(action_size, 0.0f);
@@ -159,15 +235,45 @@ void SelfPlayManager::worker_func(int worker_id) {
                 episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
 
                 int action = -1;
-                if (!root->children_.empty()) {
-                    int max_visits = -1;
-                    for (const auto& child : root->children_) {
-                        if (child && child->visit_count_ > max_visits) {
-                            max_visits = child->visit_count_;
-                            action = child->action_taken_;
-                        }
-                    }
-                }
+                 // 1. 根据当前游戏步数决定温度
+                                double current_temp = 0.0;
+                                int move_number = game.get_move_number();
+                                if (move_number < this->temperature_decay_moves_) {
+                                    current_temp = this->temperature_start_;
+                                } else {
+                                    current_temp = this->temperature_end_;
+                                }
+
+                                // 2. 如果温度足够高，则进行概率性选择
+                                if (current_temp > 0.01) {
+                                    std::vector<int> actions;
+                                    std::vector<double> distribution_weights;
+
+                                    // 计算所有子节点的访问次数的 T 次方根，作为权重
+                                    for (const auto& child : root->children_) {
+                                        if (child) {
+                                            actions.push_back(child->action_taken_);
+                                            distribution_weights.push_back(std::pow(static_cast<double>(child->visit_count_), 1.0 / current_temp));
+                                        }
+                                    }
+
+                                    if (!actions.empty()) {
+                                        // 使用离散分布根据权重进行随机抽样
+                                        static thread_local std::mt19937 generator(std::random_device{}());
+                                        std::discrete_distribution<int> dist(distribution_weights.begin(), distribution_weights.end());
+                                        int sampled_idx = dist(generator);
+                                        action = actions[sampled_idx];
+                                    }
+
+                                } else { // 3. 否则 (温度很低)，进行贪心选择 (选择访问次数最多的)
+                                    int max_visits = -1;
+                                    for (const auto& child : root->children_) {
+                                        if (child && child->visit_count_ > max_visits) {
+                                            max_visits = child->visit_count_;
+                                            action = child->action_taken_;
+                                        }
+                                    }
+                                }
                 if (action == -1) {
                     auto valid_moves = game.get_valid_moves();
                     std::vector<int> valid_move_indices;

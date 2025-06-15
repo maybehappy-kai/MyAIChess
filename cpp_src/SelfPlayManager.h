@@ -36,6 +36,13 @@ private:
     int num_total_games_;
     int num_workers_;
     int num_simulations_;
+
+    double dirichlet_alpha_;   // <--- 【新增此行】
+        double dirichlet_epsilon_; // <--- 【新增此行】
+        // 【新增】温度采样相关的成员变量
+            double temperature_start_;
+            double temperature_end_;
+            int temperature_decay_moves_;
     // =========================================================
 };
 
