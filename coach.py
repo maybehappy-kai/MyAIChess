@@ -19,6 +19,38 @@ import platform
 import ctypes
 
 
+def get_augmented_data(state, policy, board_size):
+    """
+    对单个训练样本进行8种对称变换的数据增强。
+    :param state: Numpy array, 形状为 (6, board_size, board_size)
+    :param policy: Numpy array, 形状为 (board_size * board_size,)
+    :param board_size: 棋盘大小
+    :return: 一个包含8个 (state, policy) 元组的列表
+    """
+    augmented_data = []
+
+    # 将策略向量变回二维，方便操作
+    policy_2d = policy.reshape(board_size, board_size)
+
+    # 8种对称变换
+    for i in range(1, 5):  # 旋转 0, 90, 180, 270 度
+
+        # 变换 State
+        augmented_state = np.rot90(state, i, axes=(1, 2))
+        # 变换 Policy
+        augmented_policy_2d = np.rot90(policy_2d, i)
+
+        # 原始旋转版本
+        augmented_data.append((augmented_state.copy(), augmented_policy_2d.flatten()))
+
+        # 水平翻转后再旋转的版本
+        flipped_state = np.flip(augmented_state, axis=2)
+        flipped_policy_2d = np.flip(augmented_policy_2d, axis=1)
+        augmented_data.append((flipped_state.copy(), flipped_policy_2d.flatten()))
+
+    return augmented_data
+
+
 # 定义一个仅在Windows下生效的内存清理函数
 def clear_windows_memory():
     if platform.system() == "Windows":
@@ -99,7 +131,38 @@ class Coach:
         self.model.train()
         if len(self.training_data) < self.args['batch_size']: return
         batch = random.sample(self.training_data, self.args['batch_size'])
-        states, target_policies, target_values = zip(*batch)
+        # ==================== 数据增强核心逻辑 ====================
+        augmented_batch = []
+        for state, policy, value in batch:
+            # state 和 policy 已经是 numpy array
+            # value 是标量，在增强中保持不变
+
+            # 对每个样本进行8种对称变换
+            # 注意：这里我们随机选择一种变换，而不是全部使用，以保持batch_size稳定
+            # 如果你想用全部8种，需要调整下面的逻辑
+
+            state_2d = np.array(state).reshape(6, self.args['board_size'], self.args['board_size'])
+            policy_flat = np.array(policy)
+
+            # 随机选择一种旋转和是否翻转
+            k = random.randint(0, 3)  # 旋转次数 (0-3 -> 0, 90, 180, 270)
+            flip = random.choice([True, False])  # 是否翻转
+
+            # 变换State
+            augmented_state = np.rot90(state_2d, k, axes=(1, 2))
+            if flip:
+                augmented_state = np.flip(augmented_state, axis=2)
+
+            # 变换Policy
+            policy_2d = policy_flat.reshape(self.args['board_size'], self.args['board_size'])
+            augmented_policy_2d = np.rot90(policy_2d, k)
+            if flip:
+                augmented_policy_2d = np.flip(augmented_policy_2d, axis=1)
+
+            augmented_batch.append((augmented_state.flatten(), augmented_policy_2d.flatten(), value))
+        # ========================================================
+        # 使用增强后的数据进行训练
+        states, target_policies, target_values = zip(*augmented_batch)
         states = torch.tensor(np.array(states), dtype=torch.float32).to(device)
         target_policies = torch.tensor(np.array(target_policies), dtype=torch.float32).to(device)
         target_values = torch.tensor(np.array(target_values), dtype=torch.float32).unsqueeze(1).to(device)
