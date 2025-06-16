@@ -16,7 +16,8 @@ def find_latest_model_file():
     path = ".";
     max_epoch = -1;
     latest_file = None
-    pattern = re.compile(r"model_(\d+)\.pt")
+    # --- 修改正则表达式以匹配 "model_数字_任意字符.pt" ---
+    pattern = re.compile(r"model_(\d+).*\.pt")
     for f in os.listdir(path):
         match = pattern.match(f)
         if match:

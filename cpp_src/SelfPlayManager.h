@@ -50,6 +50,16 @@ private:
             double temperature_start_;
             double temperature_end_;
             int temperature_decay_moves_;
+
+        // =======================================================
+            // --- 核心改动：用C++原生类型替换py::dict args_ ---
+            bool   enable_opening_bias_;
+            float  opening_bias_strength_;
+            bool   enable_threat_detection_;
+            float  threat_detection_bonus_;
+            bool   enable_territory_heuristic_;
+            double territory_heuristic_weight_;
+            // =======================================================
     // =========================================================
 };
 

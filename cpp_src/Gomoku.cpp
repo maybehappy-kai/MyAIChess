@@ -273,6 +273,21 @@ void Gomoku::print_board() const {
 
 // ... 在 print_board() 函数下方
 
+// in Gomoku.cpp, near other getter functions
+int Gomoku::get_territory_score() const {
+    int score = 0;
+    for (const auto& row : board_territory_) {
+        for (int cell : row) {
+            if (cell == current_player_) {
+                score++;
+            } else if (cell == -current_player_) {
+                score--;
+            }
+        }
+    }
+    return score;
+}
+
 // --- 新增辅助函数实现 ---
 int Gomoku::get_move_number() const {
     return current_move_number_;

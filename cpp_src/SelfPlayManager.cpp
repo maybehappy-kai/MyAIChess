@@ -88,6 +88,50 @@ void add_dirichlet_noise(
 }
 // ===========================================================================
 
+// ====================== 新增：活二威胁检测启发函数 ======================
+void apply_threat_detection_bias(
+    std::vector<float>& policy,
+    const Gomoku& game_state,
+    float bonus_strength)
+{
+    const int board_size = game_state.get_board_size();
+    const int player = game_state.get_current_player();
+    auto valid_moves = game_state.get_valid_moves();
+
+    std::vector<int> threat_moves;
+
+    for (int action = 0; action < board_size * board_size; ++action) {
+        if (!valid_moves[action]) continue;
+
+        Gomoku next_state = game_state;
+        next_state.execute_move(action);
+
+        // 在新状态下，检查对手是否已经输了 (因为我们的落子可能直接形成三连)
+        // 这个检查很简单，如果对手没有合法落子点，说明我们赢了
+        if (std::none_of(next_state.get_valid_moves().begin(), next_state.get_valid_moves().end(), [](bool v){ return v; })) {
+             threat_moves.push_back(action);
+             continue;
+        }
+    }
+
+    if (!threat_moves.empty()) {
+        float total_policy = 0.0f;
+        // 给所有识别出的威胁点加上巨大的奖励
+        for (int move : threat_moves) {
+            policy[move] += bonus_strength;
+        }
+        // 重新归一化
+        for(float p : policy) {
+            if (p > 0) total_policy += p;
+        }
+        if (total_policy > 0) {
+            for (float& p : policy) {
+                if (p > 0) p /= total_policy;
+            }
+        }
+    }
+}
+// =======================================================================
 
 // Python调用的顶层函数
 void run_parallel_self_play(const std::string& model_path, bool use_gpu, py::object final_data_queue, py::dict args) {
@@ -121,6 +165,12 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
             this->temperature_end_ = args["temperature_end"].cast<double>();
             this->temperature_decay_moves_ = args["temperature_decay_moves"].cast<int>();
             this->mcts_batch_size_ = args["mcts_batch_size"].cast<int>();
+             this->enable_opening_bias_ = args["enable_opening_bias"].cast<bool>();
+                this->opening_bias_strength_ = args["opening_bias_strength"].cast<float>();
+                this->enable_threat_detection_ = args["enable_threat_detection"].cast<bool>();
+                this->threat_detection_bonus_ = args["threat_detection_bonus"].cast<float>();
+                this->enable_territory_heuristic_ = args["enable_territory_heuristic"].cast<bool>();
+                this->territory_heuristic_weight_ = args["territory_heuristic_weight"].cast<double>();
 }
 // ===============================================================
 
@@ -244,9 +294,52 @@ void SelfPlayManager::worker_func(int worker_id) {
                         Node* leaf = leaves_batch[k];
                         auto current_policy = policy_batch[k];
 
-                        // *** 保留功能点：狄利克雷噪声 ***
-                        // 如果叶子节点是根节点，添加噪声
+                        // 如果叶子节点是根节点 (parent_ is null)
                         if (leaf->parent_ == nullptr) {
+                            // --- 修改开始: 注入先验知识 ---
+                            // 仅在游戏第一步 (move_number is 0) 且开关为True时生效
+                            if (this->enable_opening_bias_ && leaf->game_state_.get_move_number() == 0) { // <--- 修改点
+                                    const int board_size = leaf->game_state_.get_board_size();
+                                    float bias_strength = this->opening_bias_strength_; // <--- 修改点
+                                std::vector<float> opening_bias(board_size * board_size, 0.0f);
+
+                                // 计算中心偏置
+                                for (int r = 0; r < board_size; ++r) {
+                                    for (int c = 0; c < board_size; ++c) {
+                                        // 计算到最近边界的距离
+                                        int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
+                                        float bias = 0.0f;
+                                        if (dist_from_edge == 0) bias = 0.1f; // 边界
+                                        else if (dist_from_edge == 1) bias = 0.4f; // 次边界
+                                        else if (dist_from_edge == 2) bias = 0.8f; // 第三格，明显增大
+                                        else bias = 1.0f; // 更靠近中心，增速放缓
+
+                                        opening_bias[r * board_size + c] = bias;
+                                    }
+                                }
+
+                                // 将偏置添加到策略中并重新归一化
+                                float policy_sum = 0.0f;
+                                for(size_t i = 0; i < current_policy.size(); ++i) {
+                                    current_policy[i] += bias_strength * opening_bias[i];
+                                    policy_sum += current_policy[i];
+                                }
+                                if (policy_sum > 0.0f) {
+                                    for(size_t i = 0; i < current_policy.size(); ++i) {
+                                        current_policy[i] /= policy_sum;
+                                    }
+                                }
+                            }
+                            // --- 修改结束 ---
+
+                            // --- 新增：调用威胁检测 ---
+                                if (this->enable_threat_detection_) { // <--- 修改点
+                                        float bonus = this->threat_detection_bonus_; // <--- 修改点
+                                        apply_threat_detection_bias(current_policy, leaf->game_state_, bonus);
+                                    }
+                                // --- 新增结束 ---
+
+                            // *** 保留功能点：狄利克雷噪声 ***
                             add_dirichlet_noise(
                                 current_policy,
                                 leaf->game_state_.get_valid_moves(),
@@ -256,7 +349,24 @@ void SelfPlayManager::worker_func(int worker_id) {
                         }
 
                         leaf->expand(current_policy);
-                        leaf->backpropagate(static_cast<double>(value_batch[k]));
+                        // --- 修改开始: 混合价值启发 ---
+                            double nn_value = static_cast<double>(value_batch[k]);
+                            double final_value = nn_value;
+
+                            if (this->enable_territory_heuristic_) { // <--- 修改点
+                                double weight = this->territory_heuristic_weight_; // <--- 修改点
+                                const int board_size = leaf->game_state_.get_board_size();
+
+                                // 计算归一化的领地分数作为启发值 (-1.0 to 1.0)
+                                double territory_score = static_cast<double>(leaf->game_state_.get_territory_score());
+                                double heuristic_value = territory_score / (board_size * board_size);
+
+                                // 加权平均
+                                final_value = (1.0 - weight) * nn_value + weight * heuristic_value;
+                            }
+
+                            leaf->backpropagate(final_value);
+                            // --- 修改结束 ---
                     }
                 }
 
@@ -317,14 +427,28 @@ void SelfPlayManager::worker_func(int worker_id) {
                         std::discrete_distribution<int> dist(powered_visits.begin(), powered_visits.end());
                         action = actions[dist(generator)];
                     }
+                // in SelfPlayManager::worker_func, inside the block for choosing an action
+
                 } else if (!root->children_.empty()) {
-                    // 温度低：贪婪选择，即选择访问次数最多的动作
+                    // 温度低：贪婪选择，但随机化平局处理
                     int max_visits = -1;
                     for (const auto& child : root->children_) {
                         if (child && child->visit_count_ > max_visits) {
                             max_visits = child->visit_count_;
-                            action = child->action_taken_;
                         }
+                    }
+
+                    std::vector<int> best_actions;
+                    for (const auto& child : root->children_) {
+                        if (child && child->visit_count_ == max_visits) {
+                            best_actions.push_back(child->action_taken_);
+                        }
+                    }
+
+                    if (!best_actions.empty()) {
+                        static thread_local std::mt19937 generator(std::random_device{}());
+                        std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
+                        action = best_actions[dist(generator)];
                     }
                 }
 
@@ -500,19 +624,50 @@ void EvaluationManager::worker_func(int worker_id) {
                 }
             }
 
-            // 选择动作 (确定性选择)
+            // in EvaluationManager::worker_func
+
+            // --- 修改开始: 选择动作（随机化平局处理和回退逻辑）---
             int action = -1;
-            int max_visits = -1;
-            for (const auto& child : root->children_) {
-                if (child && child->visit_count_ > max_visits) {
-                    max_visits = child->visit_count_;
-                    action = child->action_taken_;
+            if (!root->children_.empty()) {
+                int max_visits = -1;
+                for (const auto& child : root->children_) {
+                    if (child && child->visit_count_ > max_visits) {
+                        max_visits = child->visit_count_;
+                    }
+                }
+
+                std::vector<int> best_actions;
+                for (const auto& child : root->children_) {
+                    if (child && child->visit_count_ == max_visits) {
+                        best_actions.push_back(child->action_taken_);
+                    }
+                }
+
+                if (!best_actions.empty()) {
+                    // 从所有最佳动作中随机选择一个
+                    static thread_local std::mt19937 generator(std::random_device{}());
+                    std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
+                    action = best_actions[dist(generator)];
                 }
             }
-             if (action == -1) { // Fallback for no moves
+
+            // 如果MCTS后仍然没有选出动作（例如根节点无法扩展），则随机选择一个合法的
+            if (action == -1) {
                 auto valid_moves = game.get_valid_moves();
-                for (size_t i = 0; i < valid_moves.size(); ++i) if (valid_moves[i]) { action = i; break; }
+                std::vector<int> valid_move_indices;
+                for (size_t i = 0; i < valid_moves.size(); ++i) {
+                    if (valid_moves[i]) {
+                        valid_move_indices.push_back(i);
+                    }
+                }
+                if (!valid_move_indices.empty()) {
+                    static thread_local std::mt19937 generator(std::random_device{}());
+                    std::uniform_int_distribution<size_t> distrib(0, valid_move_indices.size() - 1);
+                    action = valid_move_indices[distrib(generator)];
+                }
             }
+            // --- 修改结束 ---
+
 
             if (action == -1) break; // No moves possible, end as draw
 
@@ -623,16 +778,35 @@ int find_best_action_for_state(
         }
     }
 
+    // in find_best_action_for_state
+
+    // --- 修改开始 ---
     int action = -1;
     if (!root->children_.empty()) {
         int max_visits = -1;
         for (const auto& child : root->children_) {
             if (child && child->visit_count_ > max_visits) {
                 max_visits = child->visit_count_;
-                action = child->action_taken_;
             }
         }
+
+        std::vector<int> best_actions;
+        for (const auto& child : root->children_) {
+            if (child && child->visit_count_ == max_visits) {
+                best_actions.push_back(child->action_taken_);
+            }
+        }
+
+        if (!best_actions.empty()) {
+            // 从所有最佳动作中随机选择一个
+            // 注意：这里我们创建一个临时的生成器，因为此函数可能被频繁调用
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
+            action = best_actions[dist(gen)];
+        }
     }
+    // --- 修改结束 ---
 
     // 建议的修改 in cpp_src/SelfPlayManager.cpp
     if (action == -1) {

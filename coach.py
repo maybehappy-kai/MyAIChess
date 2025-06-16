@@ -266,8 +266,13 @@ class Coach:
                         if result.get("type") == "data":
                             game_data = result.get("data", [])
                             good_steps_from_this_game = []
+                            # in learn() function
+                            # 从 self.args 获取筛选标志，如果config里没写，默认为 True (保持原行为)
+                            enable_filtering = self.args.get('filter_zero_policy_data', True)
+
                             for state, policy, value in game_data:
-                                if np.any(policy):
+                                # 如果关闭了筛选，或者策略向量本身是有效的，则保留数据
+                                if not enable_filtering or np.any(policy):
                                     good_steps_from_this_game.append((state, policy, value))
                                 else:
                                     bad_steps_discarded += 1

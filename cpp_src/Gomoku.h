@@ -39,6 +39,7 @@ public:
     // ...
     int get_board_size() const;
     int get_move_number() const; // <-- 新增这一行
+    int get_territory_score() const; // <-- 新增此行
     void print_board() const;
     // ...
 
