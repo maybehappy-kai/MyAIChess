@@ -65,57 +65,75 @@ def clear_windows_memory():
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+# ====================== 智能模型管理函数 (全新) ======================
+
+def transfer_weights(new_model, path_to_old_weights):
+    """
+    将旧模型（通常是较小的模型）的权重加载到新模型中。
+    只加载层名和权重形状都匹配的层。
+    """
+    print(f"--- 启动迁移学习，从 '{path_to_old_weights}' 加载权重 ---")
+    old_state_dict = torch.load(path_to_old_weights, map_location=torch.device('cpu'))
+    new_model_state_dict = new_model.state_dict()
+    loaded_count = 0
+    skipped_count = 0
+    for name, param in old_state_dict.items():
+        if name in new_model_state_dict and new_model_state_dict[name].shape == param.shape:
+            new_model_state_dict[name].copy_(param)
+            loaded_count += 1
+        else:
+            skipped_count += 1
+    new_model.load_state_dict(new_model_state_dict)
+    print(f"--- 迁移学习完成。成功迁移 {loaded_count} 个层，跳过 {skipped_count} 个不兼容层。 ---")
+    return new_model
+
+
+def save_model(model, epoch, args):
+    """
+    保存模型，并自动生成带结构信息的文件名 (同时保存 .pth 和 .pt)
+    """
+    base_filename = f"model_{epoch}_{args['num_res_blocks']}x{args['num_hidden']}"
+    model_path_pth = f"{base_filename}.pth"
+    model_path_pt = f"{base_filename}.pt"
+
+    torch.save(model.state_dict(), model_path_pth)
+    print(f"模型 {model_path_pth} 已保存。")
+
+    model.eval()
+    example_input = torch.rand(1, 6, args['board_size'], args['board_size']).to(device)
+    try:
+        traced_script_module = torch.jit.trace(model, example_input)
+        traced_script_module.save(model_path_pt)
+        print(f"TorchScript模型 {model_path_pt} 已成功导出。")
+    except Exception as e:
+        print(f"【错误】导出TorchScript模型失败: {e}")
+
+
 def find_latest_model_file():
+    """
+    查找最新的模型文件，并解析其轮次数和结构信息。
+    """
     path = "."
-    max_epoch = 0
-    latest_file = None
-    pattern = re.compile(r"model_(\d+)\.pth")
+    max_epoch = -1
+    latest_file_info = None
+    pattern = re.compile(r"model_(\d+)_(\d+)x(\d+)\.pth")
+
     for f in os.listdir(path):
         match = pattern.match(f)
         if match:
             epoch = int(match.group(1))
             if epoch > max_epoch:
                 max_epoch = epoch
-                latest_file = f
-    start_epoch = max_epoch + 1 if latest_file else 1
-    return latest_file, start_epoch
+                latest_file_info = {
+                    'path': f,
+                    'epoch': epoch,
+                    'res_blocks': int(match.group(2)),
+                    'hidden_units': int(match.group(3))
+                }
+    return latest_file_info
 
 
-# ==================== 这是唯一需要修改的地方 ====================
-# 新的、为批处理MCTS优化的推理服务器
-def inference_server_func(model, device, job_q, result_q, stop_event, board_size):
-    model.eval()
-    with torch.no_grad():
-        while not stop_event.is_set():
-            try:
-                # 1. 一次只获取一个“工作包”，这个包里包含了整个批次
-                #    设置一个超时，以便能定期检查 stop_event
-                request_id, state_batch = job_q.get(timeout=1.0)
-
-                # 2. state_batch 现在是一个状态列表，直接转换成numpy数组
-                state_tensor = torch.tensor(np.array(state_batch), device=device, dtype=torch.float32)
-
-                # 确保张量形状正确 (B, C, H, W)
-                state_tensor = state_tensor.view(-1, 6, board_size, board_size)
-
-                # 使用自动混合精度进行推理
-                with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
-                    log_policies, values = model(state_tensor)
-
-                # 将torch张量转为Python列表，方便后续处理
-                # C++端将接收到 [[p1,p2...], [p1,p2...]] 和 [v1, v2...]
-                policies = torch.exp(log_policies).cpu().numpy().tolist()
-                values = values.squeeze(-1).cpu().numpy().tolist()
-
-                # 3. 将整个批次的结果打包后，一次性放回结果队列
-                result_q.put((request_id, policies, values))
-
-            except queue.Empty:
-                # 队列为空是正常现象，继续循环，检查stop_event
-                continue
-
-
-# =============================================================
+# ====================== Coach 类 (已更新 learn 方法) ======================
 
 
 class Coach:
@@ -131,6 +149,22 @@ class Coach:
         self.model.train()
         if len(self.training_data) < self.args['batch_size']: return
         batch = random.sample(self.training_data, self.args['batch_size'])
+        # ==================== 新增诊断日志 开始 ====================
+        # 为了避免刷屏，我们只检查批次中的第一个样本
+        if batch:
+            print("\n[DEBUG Coach] Inspecting a sample from the training batch:")
+            _sample_state, sample_policy, sample_value = batch[0]
+
+            # 检查策略向量中是否有非零值
+            # np.any() 会在找到任何一个非零元素时返回 True
+            if np.any(sample_policy):
+                print(f"  - Policy looks OK. Max probability: {np.max(sample_policy):.4f}")
+            else:
+                # 如果策略向量所有值都是0，这是一个非常危险的信号
+                print("  - CRITICAL WARNING: Policy vector is all zeros!")
+
+            print(f"  - Value: {sample_value:.4f}")
+        # ==================== 新增诊断日志 结束 ====================
         # ==================== 数据增强核心逻辑 ====================
         augmented_batch = []
         for state, policy, value in batch:
@@ -177,131 +211,120 @@ class Coach:
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
+        # 请用这个新版本替换旧的 learn 函数
+
     def learn(self, start_epoch=1):
         for i in range(start_epoch, start_epoch + self.args['num_iterations']):
             print(f"------ 迭代轮次: {i} ------")
-            # --- vvv 这里是需要修改的C++引擎调用部分 vvv ---
 
-            # --- vvv 这里是需要修改的核心区域 vvv ---
             print("步骤1：启动纯C++引擎进行自我对弈 (此过程将阻塞)...")
             final_data_queue = queue.Queue()
 
-            cpp_args = {
-                'num_selfPlay_episodes': self.args['num_selfPlay_episodes'],
-                'num_cpu_threads': self.args['num_cpu_threads'],
-                'num_searches': self.args['num_searches'],
-                'dirichlet_alpha': self.args['dirichlet_alpha'],  # <--- 【新增此行】
-                'dirichlet_epsilon': self.args['dirichlet_epsilon'],  # <--- 【新增此行】
-                'temperature_start': self.args['temperature_start'],  # <--- 【新增此行】
-                'temperature_end': self.args['temperature_end'],  # <--- 【新增此行】
-                'temperature_decay_moves': self.args['temperature_decay_moves']  # <--- 【新增此行】
-            }
+            cpp_args = {k: v for k, v in self.args.items()}
 
-            # 【修改】获取前一轮的模型路径，而不是当前轮次的
-            model_path_pt = f"model_{i - 1}.pt"
-            use_gpu = (device.type == 'cuda')
+            # ==================== 修正过的模型查找逻辑 开始 ====================
+            model_to_use_epoch = i - 1
+            model_to_use_path_pt = None
 
-            print(f"[Python Coach] 指示C++引擎使用模型: {model_path_pt}")
+            # 使用正则表达式模糊查找上一轮的模型文件
+            # 比如，当i=2时，查找 "model_1_" 开头，".pt" 结尾的文件
+            pattern = re.compile(f"model_{model_to_use_epoch}_.*\\.pt")
+
+            for f in os.listdir("."):
+                if pattern.match(f):
+                    model_to_use_path_pt = f
+                    break
+
+            if model_to_use_path_pt is None:
+                # 兼容旧的文件名格式 model_X.pt
+                simple_path = f"model_{model_to_use_epoch}.pt"
+                if os.path.exists(simple_path):
+                    model_to_use_path_pt = simple_path
+                else:
+                    print(f"【严重错误】无法找到第 {model_to_use_epoch} 轮的.pt模型文件！程序退出。")
+                    return
+            # ==================== 修正过的模型查找逻辑 结束 ====================
+
+            print(f"[Python Coach] 指示C++引擎使用模型: {model_to_use_path_pt}")
             cpp_mcts_engine.run_parallel_self_play(
-                model_path_pt,
-                use_gpu,
+                model_to_use_path_pt,
+                device.type == 'cuda',
                 final_data_queue,
                 cpp_args
             )
-            # --- ^^^ 修改结束 ^^^ ---
 
-            # 5. 不再需要停止和加入推理线程
-            # stop_event.set()
-            # server_thread.join()
-
-            # --- ^^^ 修改结束 ^^^ ---
-
-            print("\n自我对弈完成！正在收集数据...")
-            # 这个数据收集逻辑是正确的
-            with tqdm.tqdm(total=self.args['num_selfPlay_episodes'], desc="收集数据") as pbar:
-                games_processed = 0
+            print("\n自我对弈完成！正在进行精细化数据收集与筛选...")
+            games_processed = 0
+            good_steps_collected = 0
+            bad_steps_discarded = 0
+            with tqdm.tqdm(total=self.args['num_selfPlay_episodes'], desc="处理对局数据") as pbar:
                 while games_processed < self.args['num_selfPlay_episodes']:
                     try:
-                        result = final_data_queue.get(timeout=1.0)  # 加一个超时以防万一
+                        result = final_data_queue.get(timeout=2.0)
+                        games_processed += 1
+                        pbar.update(1)
                         if result.get("type") == "data":
-                            self.training_data.extend(result.get("data", []))
-                            games_processed += 1
-                            pbar.update(1)
+                            game_data = result.get("data", [])
+                            good_steps_from_this_game = []
+                            for state, policy, value in game_data:
+                                if np.any(policy):
+                                    good_steps_from_this_game.append((state, policy, value))
+                                else:
+                                    bad_steps_discarded += 1
+                            if good_steps_from_this_game:
+                                self.training_data.extend(good_steps_from_this_game)
+                                good_steps_collected += len(good_steps_from_this_game)
                     except queue.Empty:
-                        print("\n警告：数据队列为空，但自我对弈已结束。可能某些对局未能生成数据。")
-                        break  # 如果队列空了，就跳出循环
+                        print(f"\n警告：数据队列已空，但只处理了 {games_processed} 局。")
+                        break
 
-            print(f"\n经验库大小: {len(self.training_data)}")
-            # if len(self.training_data) > self.args['data_max_size']:
-            # self.training_data = self.training_data[-self.args['data_max_size']:]
+            print(f"\n数据处理完成！")
+            print(f"  本轮共收集到 {good_steps_collected} 个有效训练步骤。")
+            print(f"  共丢弃了 {bad_steps_discarded} 个无效步骤。")
+            print(f"  当前总经验库大小: {len(self.training_data)}")
 
-            print("\n步骤2：训练神经网络 (使用GPU)...")
-            if not self.training_data:
-                print("经验库为空，跳过本轮训练。")
+            print("\n步骤2：训练神经网络...")
+            if len(self.training_data) < self.args['batch_size']:
+                print("警告：有效数据不足，跳过本轮训练。将使用旧模型进行下一轮自我对弈。")
+                # 保存一份旧模型，但轮次+1，以确保下一轮能找到正确的模型文件
+                save_model(self.model, i, self.args)
             else:
                 self.model.train()
                 for _ in tqdm.tqdm(range(self.args['num_epochs']), desc="训练模型"):
                     self.train()
+                self.scheduler.step()
+                save_model(self.model, i, self.args)
 
-            self.scheduler.step()
-            # --- vvv 这里是您需要修改的核心区域 vvv ---
-
-            # 1. 保存标准的 .pth 权重文件 (这行代码保持不变)
-            model_path_pth = f"model_{i}.pth"
-            torch.save(self.model.state_dict(), model_path_pth)
-            print(f"模型 {model_path_pth} 已保存。")
-
-            # 2. 【新增代码】导出可供C++使用的 TorchScript 模型
-            model_path_pt = f"model_{i}.pt"
-            self.model.eval()  # 导出前，必须将模型切换到评估模式
-
-            # 创建一个符合模型输入的示例张量。
-            # 形状为 (batch_size, channels, height, width)
-            example_input = torch.rand(
-                1,
-                6,  # 根据您的Gomoku.cpp，状态有6个通道
-                self.args['board_size'],
-                self.args['board_size']
-            ).to(device)
-
-            try:
-                # 使用 torch.jit.trace 功能追踪模型的计算图
-                traced_script_module = torch.jit.trace(self.model, example_input)
-                # 将追踪到的计算图保存为 .pt 文件
-                traced_script_module.save(model_path_pt)
-                print(f"TorchScript模型 {model_path_pt} 已成功导出，可供C++使用。")
-            except Exception as e:
-                print(f"【错误】导出TorchScript模型失败: {e}")
-
-            # --- ^^^ 修改结束 ^^^ ---
             clear_windows_memory()
-        print(f"\n训练完成！")
+        print(f"\n全部训练迭代完成！")
 
-    # evaluate_models 函数无需改动
-    def evaluate_models(self, model1_path, model2_path):
+    def evaluate_models(self, model1_info, model2_info):
         print(f"\n------ 开始分组诊断式评估 (C++ 引擎驱动) ------")
-        if not model1_path or not os.path.exists(model1_path) or \
-                not model2_path or not os.path.exists(model2_path):
+        if not model1_info or not model2_info:
             print("评估缺少必要的模型文件，跳过评估。")
             return
 
-        model1_pt_path = model1_path.replace('.pth', '.pt')  # 旧模型
-        model2_pt_path = model2_path.replace('.pth', '.pt')  # 新模型
-        use_gpu = (device.type == 'cuda')
+        model1_pt_path = model1_info['path'].replace('.pth', '.pt')
+        model2_pt_path = model2_info['path'].replace('.pth', '.pt')
 
-        total_games = self.args.get('num_eval_games', 50)
-        games_per_side = total_games // 2
-        if games_per_side == 0:
-            print("评估局数过少，无法进行分组评估。")
+        if not os.path.exists(model1_pt_path) or not os.path.exists(model2_pt_path):
+            print("评估缺少必要的.pt模型文件，跳过评估。")
             return
 
         print(f"评估模型 (旧): {model1_pt_path}")
         print(f"评估模型 (新): {model2_pt_path}")
 
+        use_gpu = (device.type == 'cuda')
+        total_games = self.args.get('num_eval_games', 100)
+        games_per_side = total_games // 2
+        if games_per_side == 0:
+            print("评估局数过少，无法进行分组评估。")
+            return
+
         base_eval_args = {
             'num_eval_games': games_per_side,
             'num_eval_simulations': self.args.get('num_eval_simulations', 20),
-            'num_cpu_threads': self.args.get('num_cpu_threads', 12)
+            'num_cpu_threads': self.args.get('num_cpu_threads', 18)
         }
 
         # --- 实验一：新模型执先手 (Model 2) ---
@@ -338,74 +361,101 @@ class Coach:
 
         if games_per_side > 0 and (new_as_p1_wins / games_per_side) > 0.9 and (old_as_p1_wins / games_per_side) > 0.9:
             print("\n【诊断结论】: AI已发现并掌握了 '先手必胜' 策略。")
-            print("下一步建议：在自对弈中引入'狄利克雷噪声'和'温度采样'来打破僵局，探索后手获胜的可能性。")
         elif overall_win_rate > self.args.get('eval_win_rate', 0.52):
             print("\n【诊断结论】: 新模型有显著提升！👍")
         else:
             print("\n【诊断结论】: 新模型提升不明显或没有提升，可能陷入了局部最优。")
 
 
+# ==================== 全新的、智能化的主函数逻辑 ====================
 if __name__ == '__main__':
     print(f"将要使用的设备 (主进程/训练): {device}")
-    model_before_training, start_epoch = find_latest_model_file()
-    model = ExtendedConnectNet(
+
+    # 1. 查找最新的已有模型
+    latest_model_info = find_latest_model_file()
+    start_epoch = 1
+
+    # 2. 创建当前配置对应的模型实例
+    current_model = ExtendedConnectNet(
         board_size=args['board_size'],
         num_res_blocks=args['num_res_blocks'],
         num_hidden=args['num_hidden']
     ).to(device)
 
-    if model_before_training:
-        try:
-            print(f"找到最新模型 {model_before_training}，将从第 {start_epoch} 轮开始继续训练...")
-            model.load_state_dict(torch.load(model_before_training, map_location=device))
-            print("模型加载成功！")
-        except Exception as e:
-            print(f"模型加载失败: {e}，将从零开始训练。")
-            start_epoch = 1
-            model_before_training = None
-    else:
-        # --- vvv 这里是需要修改的核心区域 vvv ---
+    model_info_before_training = None  # 用于评估
+
+    # 3. 根据查找到的模型信息，决定如何加载权重
+    if latest_model_info is None:
+        # --- 情况一：全新开始 ---
         print("未找到任何已有模型，将从第 1 轮开始全新训练。")
+        start_epoch = 1
         print("正在创建并保存初始随机模型 (model_0)...")
+        current_model.train()
+        print("[DIAGNOSTIC] Exporting initial model in .train() mode to handle BatchNorm.")
+        save_model(current_model, 0, args)
+        model_info_before_training = find_latest_model_file()
 
-        # 【新增代码】为第一轮自我对弈准备一个“第0代”模型
-        model.eval()
-        example_input = torch.rand(1, 6, args['board_size'], args['board_size']).to(device)
-        try:
-            traced_script_module = torch.jit.trace(model, example_input)
-            traced_script_module.save("model_0.pt")
-            torch.save(model.state_dict(), "model_0.pth")
-            print("初始模型 model_0.pt 和 model_0.pth 已保存。")
-        except Exception as e:
-            print(f"【错误】创建初始模型失败: {e}, 程序无法继续。")
-            exit()  # 如果初始模型都创建失败，直接退出
+    else:
+        # --- 发现已有模型，判断结构是否一致 ---
+        print(f"找到最新模型: {latest_model_info['path']} (第 {latest_model_info['epoch']} 轮)")
+        start_epoch = latest_model_info['epoch'] + 1
+        model_info_before_training = latest_model_info
 
-        start_epoch = 1  # 确认从第1轮开始
-        # --- ^^^ 修改结束 ^^^ ---
+        config_blocks = args['num_res_blocks']
+        config_hidden = args['num_hidden']
 
-    coach = Coach(model, args)
+        is_same_architecture = (latest_model_info['res_blocks'] == config_blocks and
+                                latest_model_info['hidden_units'] == config_hidden)
+
+        if is_same_architecture:
+            # --- 情况二：结构一致，直接续训 ---
+            print("模型结构与当前配置一致，直接加载权重继续训练。")
+            try:
+                current_model.load_state_dict(torch.load(latest_model_info['path'], map_location=device))
+                print("权重加载成功！")
+            except Exception as e:
+                print(f"加载权重失败: {e}，将从随机权重开始。")
+                start_epoch = 1
+        else:
+            # --- 情况三：结构不一致，执行自动迁移学习 ---
+            print("模型结构与当前配置不一致，将执行自动迁移学习。")
+            print(f"  旧结构: {latest_model_info['res_blocks']} res_blocks, {latest_model_info['hidden_units']} hidden")
+            print(f"  新结构: {config_blocks} res_blocks, {config_hidden} hidden")
+            try:
+                current_model = transfer_weights(current_model, latest_model_info['path'])
+
+                # 为迁移学习后的新模型也创建一个 .pt 文件，以便下一轮C++自对弈能找到它
+                epoch_for_pt_saving = latest_model_info['epoch']
+                base_filename = f"model_{epoch_for_pt_saving}_{config_blocks}x{config_hidden}"
+                print(f"为迁移学习后的新模型创建 .pt 文件: {base_filename}.pt")
+
+                current_model.eval()
+                example_input = torch.rand(1, 6, args['board_size'], args['board_size']).to(device)
+                traced_script_module = torch.jit.trace(current_model, example_input)
+                traced_script_module.save(f"{base_filename}.pt")
+
+            except Exception as e:
+                print(f"迁移学习失败: {e}，将从随机权重开始训练新结构模型。")
+
+    # 4. 开始训练流程
+    coach = Coach(current_model, args)
     coach.learn(start_epoch=start_epoch)
-    # ... (后续评估代码不变) ...
-    model_after_training, _ = find_latest_model_file()
-    if model_before_training and model_after_training != model_before_training:
-        coach.evaluate_models(model_before_training, model_after_training)
+
+    # 5. 训练后评估
+    model_info_after_training = find_latest_model_file()
+
+    if model_info_before_training and model_info_after_training and \
+            model_info_before_training['path'] != model_info_after_training['path']:
+        coach.evaluate_models(model_info_before_training, model_info_after_training)
     else:
         print("\n未进行有效的新一轮训练或未找到旧模型，跳过评估。")
 
-        # ====================== 新增的核心清理代码 ======================
-        # 在程序即将结束时，手动触发资源释放，避免退出时卡死
+    # 6. 内存清理 (这部分逻辑和您原来的一样)
+    print("\n训练全部完成，正在手动清理内存...")
+    if 'coach' in locals() and hasattr(coach, 'training_data'):
+        coach.training_data.clear()
+        print("经验回放池已清空。")
+    import gc
 
-        print("\n训练全部完成，正在手动清理内存...")
-
-        # 检查coach对象是否存在，并清空其内部的大数据结构
-        if 'coach' in locals() and hasattr(coach, 'training_data'):
-            coach.training_data.clear()
-            print("经验回放池已清空。")
-
-        # 手动调用Python的垃圾回收器
-        import gc
-
-        gc.collect()
-
-        print("内存清理完成。程序即将退出。")
-        # ===============================================================
+    gc.collect()
+    print("内存清理完成。程序即将退出。")

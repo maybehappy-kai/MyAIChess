@@ -120,8 +120,37 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
             this->temperature_start_ = args["temperature_start"].cast<double>();
             this->temperature_end_ = args["temperature_end"].cast<double>();
             this->temperature_decay_moves_ = args["temperature_decay_moves"].cast<int>();
+            this->mcts_batch_size_ = args["mcts_batch_size"].cast<int>();
 }
 // ===============================================================
+
+// ==================== 新增：搬运工线程的完整实现 ====================
+void SelfPlayManager::collector_func() {
+    while (completed_games_count_ < num_total_games_) {
+        TrainingDataPacket packet;
+        if (data_collector_queue_.try_pop(packet)) {
+            // 成功从中转站取出数据包
+            // 现在，只有这个线程需要获取GIL来与Python交互
+            py::gil_scoped_acquire acquire;
+
+            py::list training_examples_list;
+            for (const auto& ex : packet) {
+                training_examples_list.append(py::make_tuple(
+                    py::cast(std::get<0>(ex)),
+                    py::cast(std::get<1>(ex)),
+                    py::cast(std::get<2>(ex))
+                ));
+            }
+            py::dict data_to_send;
+            data_to_send["type"] = "data";
+            data_to_send["data"] = training_examples_list;
+            final_data_queue_.attr("put")(data_to_send);
+        } else {
+            // 中转站暂时为空，短暂休眠一下，避免空转浪费CPU
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+}
 
 void SelfPlayManager::run() {
     for (int i = 0; i < this->num_total_games_; ++i) {
@@ -132,6 +161,9 @@ void SelfPlayManager::run() {
         std::lock_guard<std::mutex> lock(g_io_mutex);
         std::cout << "[C++ Manager] Starting " << this->num_workers_ << " worker threads to play " << this->num_total_games_ << " games..." << std::endl;
     }
+
+    // ==================== 新增：启动搬运工线程 ====================
+        collector_thread_ = std::thread(&SelfPlayManager::collector_func, this);
 
     threads_.reserve(this->num_workers_);
     for (int i = 0; i < this->num_workers_; ++i) {
@@ -144,187 +176,201 @@ void SelfPlayManager::run() {
         }
     }
 
+    // ==================== 新增：等待搬运工线程结束 ====================
+        if (collector_thread_.joinable()) {
+            collector_thread_.join();
+        }
+
     {
         std::lock_guard<std::mutex> lock(g_io_mutex);
         std::cout << "[C++ Manager] All self-play games finished." << std::endl;
     }
 }
 
+// ====================== 最终版工作函数 (包含正确的MCTS和所有原有功能) ======================
 void SelfPlayManager::worker_func(int worker_id) {
     while (true) {
         int game_idx;
         if (!task_queue_.try_pop(game_idx)) {
-            break;
+            break; // 任务队列空，线程退出
         }
 
         try {
             Gomoku game;
             std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
-
-            // ====================== 核心修正区域：工作函数 ======================
-            // 直接使用C++成员变量，不再访问Python字典
-            const int num_simulations = this->num_simulations_;
-            // ===============================================================
-
             const int action_size = game.get_board_size() * game.get_board_size();
 
+            // ====================== 单局游戏主循环 ======================
             while (true) {
                 auto root = std::make_unique<Node>(game);
 
-                std::vector<Node*> leaves;
-                leaves.reserve(num_simulations);
-                for (int i = 0; i < num_simulations; ++i) {
-                    Node* node = root.get();
-                    while (node->is_fully_expanded()) {
-                        node = node->select_child();
-                    }
-                    auto [end_value, is_terminal] = node->game_state_.get_game_ended();
-                    double value_to_propagate = end_value;
-                    if (is_terminal) {
-                        value_to_propagate *= node->game_state_.get_current_player();
-                        node->backpropagate(value_to_propagate);
-                        continue;
-                    }
-                    leaves.push_back(node);
-                }
+                // === 1. 正确的MCTS批处理搜索 ===
+                const int num_simulations = this->num_simulations_;
+                const int batch_size = this->mcts_batch_size_;
 
-                if (!leaves.empty()) {
-                    std::sort(leaves.begin(), leaves.end());
-                    leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
+                for (int i = 0; i < num_simulations; i += batch_size) {
+                    std::vector<Node*> leaves_batch;
+                    leaves_batch.reserve(batch_size);
                     std::vector<std::vector<float>> state_batch;
-                    state_batch.reserve(leaves.size());
-                    for (const auto* leaf : leaves) {
-                        state_batch.push_back(leaf->game_state_.get_state());
-                    }
-                    auto [policy_batch, value_batch] = engine_->infer(state_batch);
-                    // ===================【核心修改：应用噪声】===================
-                                        for (size_t i = 0; i < leaves.size(); ++i) {
-                                            Node* leaf = leaves[i];
-                                            auto current_policy = policy_batch[i]; // 拷贝一份策略
+                    state_batch.reserve(batch_size);
 
-                                            // 检查当前节点是否为MCTS搜索树的根节点 (只有根节点没有父节点)
-                                            if (leaf->parent_ == nullptr) {
-                                                // 是根节点，对其策略添加狄利克雷噪声
-                                                add_dirichlet_noise(
-                                                    current_policy, // 传入引用，函数内部会直接修改它
-                                                    leaf->game_state_.get_valid_moves(),
-                                                    this->dirichlet_alpha_,
-                                                    this->dirichlet_epsilon_
-                                                );
-                                            }
+                    // 1a. 收集一个批次的叶子节点
+                    for (int j = 0; j < batch_size && i + j < num_simulations; ++j) {
+                        Node* node = root.get();
 
-                                            // 使用原始策略或加噪后的策略来扩展节点
-                                            leaf->expand(current_policy);
-                                            leaf->backpropagate(static_cast<double>(value_batch[i]));
-                                        }
-                                        // ==========================================================
-                }
+                        while (node->is_fully_expanded()) {
+                            node = node->select_child();
+                        }
 
-                std::vector<float> action_probs(action_size, 0.0f);
-                if (!root->children_.empty()) {
-                    for (const auto& child : root->children_) {
-                        if (child && child->action_taken_ >= 0 && child->action_taken_ < action_size) {
-                            action_probs[child->action_taken_] = static_cast<float>(child->visit_count_);
+                        auto [end_value, is_terminal] = node->game_state_.get_game_ended();
+                        if (is_terminal) {
+                            double value_to_propagate = end_value * node->game_state_.get_current_player();
+                            node->backpropagate(value_to_propagate);
+                        } else {
+                            leaves_batch.push_back(node);
+                            state_batch.push_back(node->game_state_.get_state());
                         }
                     }
-                    float sum_visits = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
-                    if (sum_visits > 0) {
-                        for (float& p : action_probs) { p /= sum_visits; }
+
+                    if (leaves_batch.empty()) {
+                        continue;
+                    }
+
+                    // 1b. 对批次进行神经网络推理
+                    auto [policy_batch, value_batch] = engine_->infer(state_batch);
+
+                    // 1c. 扩展和反向传播批次中的每一个叶子节点
+                    for (size_t k = 0; k < leaves_batch.size(); ++k) {
+                        Node* leaf = leaves_batch[k];
+                        auto current_policy = policy_batch[k];
+
+                        // *** 保留功能点：狄利克雷噪声 ***
+                        // 如果叶子节点是根节点，添加噪声
+                        if (leaf->parent_ == nullptr) {
+                            add_dirichlet_noise(
+                                current_policy,
+                                leaf->game_state_.get_valid_moves(),
+                                this->dirichlet_alpha_,
+                                this->dirichlet_epsilon_
+                            );
+                        }
+
+                        leaf->expand(current_policy);
+                        leaf->backpropagate(static_cast<double>(value_batch[k]));
                     }
                 }
+
+                // === 2. 计算用于训练的策略向量 ===
+                std::vector<float> action_probs(action_size, 0.0f);
+                if (!root->children_.empty()) {
+                    float sum_visits = 0;
+                    for (const auto& child : root->children_) {
+                        if (child) {
+                           sum_visits += child->visit_count_;
+                        }
+                    }
+                    // 归一化访问次数，得到策略概率
+                    if (sum_visits > 0) {
+                        for (const auto& child : root->children_) {
+                           if (child && child->action_taken_ >= 0 && child->action_taken_ < action_size) {
+                               action_probs[child->action_taken_] = static_cast<float>(child->visit_count_) / sum_visits;
+                           }
+                        }
+                    }
+                }
+
+                 // ==================== 验证日志 开始 ====================
+                                /*if (game.get_move_number() < 5) {
+                                    float policy_sum = std::accumulate(action_probs.begin(), action_probs.end(), 0.0f);
+                                    if (policy_sum < 0.0001f) {
+                                        std::lock_guard<std::mutex> lock(g_io_mutex);
+                                        std::cerr << "[VERIFICATION LOG] Game " << game_idx
+                                                  << ", Move " << game.get_move_number()
+                                                  << ": CRITICAL WARNING! Generated action_probs is still all zeros." << std::endl;
+                                    } else {
+                                        std::lock_guard<std::mutex> lock(g_io_mutex);
+                                        std::cout << "[VERIFICATION LOG] Game " << game_idx
+                                                  << ", Move " << game.get_move_number()
+                                                  << ": Policy generation is OK. Sum=" << policy_sum << std::endl;
+                                    }
+                                }*/
+                                // ==================== 验证日志 结束 ====================
+
                 episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
 
+                // === 3. ***保留功能点：温度采样和最终动作选择*** ===
                 int action = -1;
-                 // 1. 根据当前游戏步数决定温度
-                                double current_temp = 0.0;
-                                int move_number = game.get_move_number();
-                                if (move_number < this->temperature_decay_moves_) {
-                                    current_temp = this->temperature_start_;
-                                } else {
-                                    current_temp = this->temperature_end_;
-                                }
+                double current_temp = (game.get_move_number() < this->temperature_decay_moves_) ? this->temperature_start_ : this->temperature_end_;
 
-                                // 2. 如果温度足够高，则进行概率性选择
-                                if (current_temp > 0.01) {
-                                    std::vector<int> actions;
-                                    std::vector<double> distribution_weights;
+                if (current_temp > 0.01 && !root->children_.empty()) {
+                    // 温度高：按访问次数的幂次方进行概率采样，以增加探索
+                    std::vector<double> powered_visits;
+                    std::vector<int> actions;
+                    for (const auto& child : root->children_) {
+                        if (child) {
+                            powered_visits.push_back(std::pow(static_cast<double>(child->visit_count_), 1.0 / current_temp));
+                            actions.push_back(child->action_taken_);
+                        }
+                    }
+                    if (!actions.empty()) {
+                        static thread_local std::mt19937 generator(std::random_device{}());
+                        std::discrete_distribution<int> dist(powered_visits.begin(), powered_visits.end());
+                        action = actions[dist(generator)];
+                    }
+                } else if (!root->children_.empty()) {
+                    // 温度低：贪婪选择，即选择访问次数最多的动作
+                    int max_visits = -1;
+                    for (const auto& child : root->children_) {
+                        if (child && child->visit_count_ > max_visits) {
+                            max_visits = child->visit_count_;
+                            action = child->action_taken_;
+                        }
+                    }
+                }
 
-                                    // 计算所有子节点的访问次数的 T 次方根，作为权重
-                                    for (const auto& child : root->children_) {
-                                        if (child) {
-                                            actions.push_back(child->action_taken_);
-                                            distribution_weights.push_back(std::pow(static_cast<double>(child->visit_count_), 1.0 / current_temp));
-                                        }
-                                    }
-
-                                    if (!actions.empty()) {
-                                        // 使用离散分布根据权重进行随机抽样
-                                        static thread_local std::mt19937 generator(std::random_device{}());
-                                        std::discrete_distribution<int> dist(distribution_weights.begin(), distribution_weights.end());
-                                        int sampled_idx = dist(generator);
-                                        action = actions[sampled_idx];
-                                    }
-
-                                } else { // 3. 否则 (温度很低)，进行贪心选择 (选择访问次数最多的)
-                                    int max_visits = -1;
-                                    for (const auto& child : root->children_) {
-                                        if (child && child->visit_count_ > max_visits) {
-                                            max_visits = child->visit_count_;
-                                            action = child->action_taken_;
-                                        }
-                                    }
-                                }
+                // 如果由于某种原因没选出动作（例如MCTS后依然没有子节点），随机选择一个
                 if (action == -1) {
                     auto valid_moves = game.get_valid_moves();
                     std::vector<int> valid_move_indices;
                     for (size_t i = 0; i < valid_moves.size(); ++i) {
-                        if (valid_moves[i]) {
-                            valid_move_indices.push_back(i);
-                        }
+                        if (valid_moves[i]) valid_move_indices.push_back(i);
                     }
-                    if (!valid_move_indices.empty()) {
-                        std::random_device rd;
-                        std::mt19937 gen(rd());
-                        std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
-                        action = valid_move_indices[distrib(gen)];
-                    } else {
-                        break;
-                    }
+                    if (valid_move_indices.empty()) break; // 没有合法走法了，结束游戏
+                    std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
+                    static thread_local std::mt19937 generator(std::random_device{}());
+                    action = valid_move_indices[distrib(generator)];
                 }
+
+                // === 4. 执行动作并为下一轮做准备 ===
                 game.execute_move(action);
 
+                // 游戏结束判断与数据处理
                 auto [final_value, is_done] = game.get_game_ended();
                 if (is_done) {
-                    std::vector<std::tuple<std::vector<float>, std::vector<float>, double>> cpp_training_examples;
-                    cpp_training_examples.reserve(episode_data.size());
-                    for (const auto& example : episode_data) {
-                        double corrected_value = final_value * std::get<2>(example);
-                        cpp_training_examples.emplace_back(std::get<0>(example), std::get<1>(example), corrected_value);
-                    }
-                    {
-                        py::gil_scoped_acquire acquire;
-                        py::list training_examples_list;
-                        for (const auto& ex : cpp_training_examples) {
-                            training_examples_list.append(py::make_tuple(
-                                py::cast(std::get<0>(ex)),
-                                py::cast(std::get<1>(ex)),
-                                py::cast(std::get<2>(ex))
-                            ));
-                        }
-                        py::dict data_to_send;
-                        data_to_send["type"] = "data";
-                        data_to_send["data"] = training_examples_list;
-                        final_data_queue_.attr("put")(data_to_send);
-                    }
-                    break;
+                    // ==================== 修改数据提交流程 开始 ====================
+                                        TrainingDataPacket cpp_training_examples; // 使用我们定义的新类型
+                                        cpp_training_examples.reserve(episode_data.size());
+                                        for (const auto& example : episode_data) {
+                                            double corrected_value = final_value * std::get<2>(example);
+                                            cpp_training_examples.emplace_back(std::get<0>(example), std::get<1>(example), corrected_value);
+                                        }
+
+                                        // 不再获取GIL，而是直接将C++数据包推入C++中转队列
+                                        data_collector_queue_.push(std::move(cpp_training_examples));
+
+                                        // 原子地增加已完成游戏计数
+                                        completed_games_count_++;
+
+                                        // ==================== 修改数据提交流程 结束 ====================
+                                        break;
                 }
             }
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(g_io_mutex);
-            std::cerr << "[C++ Worker " << worker_id << ", Game " << game_idx << "] FATAL_ERROR: A C++ standard exception occurred! what(): " << e.what() << std::endl;
+            std::cerr << "[C++ Worker " << worker_id << ", Game " << game_idx << "] Exception: " << e.what() << std::endl;
         } catch (...) {
             std::lock_guard<std::mutex> lock(g_io_mutex);
-            std::cerr << "[C++ Worker " << worker_id << ", Game " << game_idx << "] FATAL_ERROR: An unknown exception occurred!" << std::endl;
+            std::cerr << "[C++ Worker " << worker_id << ", Game " << game_idx << "] Unknown exception occurred!" << std::endl;
         }
     }
 }
@@ -588,12 +634,34 @@ int find_best_action_for_state(
         }
     }
 
+    // 建议的修改 in cpp_src/SelfPlayManager.cpp
     if (action == -1) {
+       // ==================== 新增诊断日志 开始 ====================
+               {
+                   // 使用 g_io_mutex 来确保线程安全的输出
+                   std::lock_guard<std::mutex> lock(g_io_mutex);
+                   std::cerr << "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                             << "[AI FALLBACK] MCTS search FAILED for player " << current_player
+                             << " on move " << current_move_number
+                             << ".\n"
+                             << "              Triggering FALLBACK logic: finding first valid move from top-left.\n"
+                             << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n" << std::endl;
+               }
+               // ==================== 新增诊断日志 结束 ====================
         auto valid_moves = game.get_valid_moves();
+        std::vector<int> valid_move_indices;
         for (size_t i = 0; i < valid_moves.size(); ++i) {
-            if (valid_moves[i]) return i;
+            if (valid_moves[i]) {
+                valid_move_indices.push_back(i);
+            }
+        }
+        if (!valid_move_indices.empty()) {
+            // 如果别无选择，至少随机选一个，而不是永远选第一个
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
+            action = valid_move_indices[distrib(gen)];
         }
     }
-
     return action;
 }

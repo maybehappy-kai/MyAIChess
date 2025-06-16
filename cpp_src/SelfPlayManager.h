@@ -13,6 +13,9 @@ extern std::mutex g_io_mutex;
 
 namespace py = pybind11;
 
+// ==================== 新增：定义一个清晰的数据包类型 ====================
+using TrainingDataPacket = std::vector<std::tuple<std::vector<float>, std::vector<float>, double>>;
+
 class SelfPlayManager {
 public:
     SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::object final_data_queue, py::dict args);
@@ -21,21 +24,25 @@ public:
 private:
     void worker_func(int worker_id);
 
-    // Python对象
-    py::object final_data_queue_;
+    // ==================== 新增：搬运工线程的声明 ====================
+        void collector_func();
 
-    // C++推理引擎
-    std::shared_ptr<InferenceEngine> engine_;
+        py::object final_data_queue_;
+        std::shared_ptr<InferenceEngine> engine_;
+        std::vector<std::thread> threads_;
+        SafeQueue<int> task_queue_;
 
-    // 线程池与任务管理
-    std::vector<std::thread> threads_;
-    SafeQueue<int> task_queue_;
+        // ==================== 新增：C++数据中转站和搬运工线程 ====================
+        SafeQueue<TrainingDataPacket> data_collector_queue_;
+        std::thread collector_thread_;
+        std::atomic<int> completed_games_count_{0}; // 用于通知搬运工何时下班
 
     // ====================== 核心修正区域 ======================
     // 不再持有 py::dict, 而是将参数用C++原生类型存储，避免生命周期问题
     int num_total_games_;
     int num_workers_;
     int num_simulations_;
+    int mcts_batch_size_;      // MCTS推理时的批处理大小
 
     double dirichlet_alpha_;   // <--- 【新增此行】
         double dirichlet_epsilon_; // <--- 【新增此行】

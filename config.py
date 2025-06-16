@@ -2,15 +2,15 @@
 args = {
     'C': 2,
     'num_searches': 1600,  # 保证AI思考深度，确保CPU有足够的工作量
-    'num_iterations': 100,  # 总迭代轮数
-    'num_selfPlay_episodes': 960,  # 每轮自我对弈的局数
-    'num_cpu_threads': 16,       # <-- 新增：C++工作线程池的大小
-    'num_epochs': 4,  # 每轮训练的代数
-    'batch_size': 256,  # 增大批处理大小，让GPU一次处理更多数据
+    'num_iterations': 20,  # 总迭代轮数
+    'num_selfPlay_episodes': 1000,  # 每轮自我对弈的局数
+    'num_cpu_threads': 18,       # <-- 新增：C++工作线程池的大小
+    'num_epochs': 2,  # 每轮训练的代数
+    'batch_size': 512,  # 增大批处理大小，让GPU一次处理更多数据
     'learning_rate': 0.001,
     'data_max_size': 1000000,
-    'num_res_blocks': 30,
-    'num_hidden': 512,
+    'num_res_blocks': 9,
+    'num_hidden': 128,
     'dirichlet_alpha': 0.3,
     'dirichlet_epsilon': 0.25, # <---【新增此行】噪声权重
     # 在config.py的args字典里任意位置加入这行
@@ -21,6 +21,7 @@ args = {
         'temperature_decay_moves': 10,    # <--- 【新增】温度衰减的步数 (前10步使用高温探索)
 
     # --- 评估体系参数 ---
-    'num_eval_games': 320,  # 最终评估时，新旧模型对战的局数
+    'num_eval_games': 20,  # 最终评估时，新旧模型对战的局数
     'board_size': 9,
+    'mcts_batch_size': 32, # C++ MCTS 推理时的批处理大小
 }
