@@ -92,7 +92,10 @@ def save_model(model, epoch, args):
     """
     保存模型，并自动生成带结构信息的文件名 (同时保存 .pth 和 .pt)
     """
-    base_filename = f"model_{epoch}_{args['num_res_blocks']}x{args['num_hidden']}"
+    # vvvvvv 从args获取通道数并构建新的文件名 vvvvvv
+    num_channels = args['num_channels']
+    base_filename = f"model_{epoch}_{args['num_res_blocks']}x{args['num_hidden']}_{num_channels}c"
+    # ^^^^^^ 从args获取通道数并构建新的文件名 ^^^^^^
     model_path_pth = f"{base_filename}.pth"
     model_path_pt = f"{base_filename}.pt"
 
@@ -100,7 +103,9 @@ def save_model(model, epoch, args):
     print(f"模型 {model_path_pth} 已保存。")
 
     model.eval()
-    example_input = torch.rand(1, 6, args['board_size'], args['board_size']).to(device)
+    # vvvvvv 使用args中的通道数创建示例输入 vvvvvv
+    example_input = torch.rand(1, num_channels, args['board_size'], args['board_size']).to(device)
+    # ^^^^^^ 使用args中的通道数创建示例输入 ^^^^^^
     try:
         traced_script_module = torch.jit.trace(model, example_input)
         traced_script_module.save(model_path_pt)
@@ -116,7 +121,9 @@ def find_latest_model_file():
     path = "."
     max_epoch = -1
     latest_file_info = None
-    pattern = re.compile(r"model_(\d+)_(\d+)x(\d+)\.pth")
+    # vvvvvv 使用新的正则表达式以匹配包含通道数的文件名 vvvvvv
+    pattern = re.compile(r"model_(\d+)_(\d+)x(\d+)_(\d+)c\.pth")
+    # ^^^^^^ 使用新的正则表达式以匹配包含通道数的文件名 ^^^^^^
 
     for f in os.listdir(path):
         match = pattern.match(f)
@@ -128,7 +135,10 @@ def find_latest_model_file():
                     'path': f,
                     'epoch': epoch,
                     'res_blocks': int(match.group(2)),
-                    'hidden_units': int(match.group(3))
+                    'hidden_units': int(match.group(3)),
+                    # vvvvvv 解析并存储文件名中的通道数 vvvvvv
+                    'channels': int(match.group(4))
+                    # ^^^^^^ 解析并存储文件名中的通道数 ^^^^^^
                 }
     return latest_file_info
 
@@ -175,7 +185,8 @@ class Coach:
             # 注意：这里我们随机选择一种变换，而不是全部使用，以保持batch_size稳定
             # 如果你想用全部8种，需要调整下面的逻辑
 
-            state_2d = np.array(state).reshape(6, self.args['board_size'], self.args['board_size'])
+            state_2d = np.array(state).reshape(self.args['num_channels'], self.args['board_size'],
+                                               self.args['board_size'])
             policy_flat = np.array(policy)
 
             # 随机选择一种旋转和是否翻转
@@ -200,7 +211,7 @@ class Coach:
         states = torch.tensor(np.array(states), dtype=torch.float32).to(device)
         target_policies = torch.tensor(np.array(target_policies), dtype=torch.float32).to(device)
         target_values = torch.tensor(np.array(target_values), dtype=torch.float32).unsqueeze(1).to(device)
-        states = states.view(-1, 6, self.args['board_size'], self.args['board_size'])
+        states = states.view(-1, self.args['num_channels'], self.args['board_size'], self.args['board_size'])
         self.optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
             pred_log_policies, pred_values = self.model(states)
@@ -222,28 +233,44 @@ class Coach:
 
             cpp_args = {k: v for k, v in self.args.items()}
 
-            # ==================== 修正过的模型查找逻辑 开始 ====================
+            # ==================== 新的、更健壮的模型查找逻辑 开始 ====================
             model_to_use_epoch = i - 1
-            model_to_use_path_pt = None
 
-            # 使用正则表达式模糊查找上一轮的模型文件
-            # 比如，当i=2时，查找 "model_1_" 开头，".pt" 结尾的文件
-            pattern = re.compile(f"model_{model_to_use_epoch}_.*\\.pt")
+            # 1. 直接根据当前配置构建期望的、精确的模型文件名
+            expected_res_blocks = self.args['num_res_blocks']
+            expected_hidden = self.args['num_hidden']
+            expected_channels = self.args['num_channels']  # <--- 获取通道数
+            model_to_use_path_pt = f"model_{model_to_use_epoch}_{expected_res_blocks}x{expected_hidden}_{expected_channels}c.pt"
 
-            for f in os.listdir("."):
-                if pattern.match(f):
-                    model_to_use_path_pt = f
-                    break
+            # 2. 检查这个精确的文件是否存在
+            if not os.path.exists(model_to_use_path_pt):
+                # 如果不存在，打印警告并回退到旧的模糊搜索逻辑，以确保最大兼容性
+                print(f"警告：无法找到与当前配置完全匹配的模型 '{model_to_use_path_pt}'。")
+                print("将回退到模糊搜索模式...")
 
+                model_to_use_path_pt = None  # 重置路径
+                pattern = re.compile(f"model_{model_to_use_epoch}_.*\\.pt")
+                # 寻找最新的一个模型
+                latest_found_time = -1
+                for f in os.listdir("."):
+                    if pattern.match(f):
+                        file_time = os.path.getmtime(f)
+                        if file_time > latest_found_time:
+                            latest_found_time = file_time
+                            model_to_use_path_pt = f
+
+                if model_to_use_path_pt:
+                    print(f"找到最近修改的后备模型: '{model_to_use_path_pt}'。注意：这可能与C++数据格式不匹配！")
+
+            # 3. 如果以上两种方法都找不到，再尝试最原始的文件名格式
             if model_to_use_path_pt is None:
-                # 兼容旧的文件名格式 model_X.pt
                 simple_path = f"model_{model_to_use_epoch}.pt"
                 if os.path.exists(simple_path):
                     model_to_use_path_pt = simple_path
                 else:
-                    print(f"【严重错误】无法找到第 {model_to_use_epoch} 轮的.pt模型文件！程序退出。")
+                    print(f"【严重错误】无法找到第 {model_to_use_epoch} 轮的任何.pt模型文件！程序退出。")
                     return
-            # ==================== 修正过的模型查找逻辑 结束 ====================
+            # ==================== 新的、更健壮的模型查找逻辑 结束 ====================
 
             print(f"[Python Coach] 指示C++引擎使用模型: {model_to_use_path_pt}")
             cpp_mcts_engine.run_parallel_self_play(
@@ -374,46 +401,56 @@ class Coach:
 
 # ==================== 全新的、智能化的主函数逻辑 ====================
 if __name__ == '__main__':
+    # ------------------ 参数计算中心 ------------------
+    history_channels = (args.get('history_steps', 0) + 1) * 4
+    meta_channels = 4
+    total_channels = history_channels + meta_channels
+    args['num_channels'] = total_channels
+
+    print("=" * 50)
+    print("MyAIChess 配置加载完成")
+    print(f"历史步数: {args.get('history_steps', 0)}")
+    print(f"计算出的总输入通道数: {args['num_channels']}")
+    print("=" * 50)
+    # ----------------------------------------------------
+
     print(f"将要使用的设备 (主进程/训练): {device}")
 
-    # 1. 查找最新的已有模型
     latest_model_info = find_latest_model_file()
     start_epoch = 1
 
-    # 2. 创建当前配置对应的模型实例
+    # 使用动态通道数创建模型实例
     current_model = ExtendedConnectNet(
         board_size=args['board_size'],
         num_res_blocks=args['num_res_blocks'],
-        num_hidden=args['num_hidden']
+        num_hidden=args['num_hidden'],
+        num_channels=args['num_channels']
     ).to(device)
 
-    model_info_before_training = None  # 用于评估
+    model_info_before_training = None
 
-    # 3. 根据查找到的模型信息，决定如何加载权重
     if latest_model_info is None:
-        # --- 情况一：全新开始 ---
         print("未找到任何已有模型，将从第 1 轮开始全新训练。")
         start_epoch = 1
         print("正在创建并保存初始随机模型 (model_0)...")
-        current_model.train()
-        print("[DIAGNOSTIC] Exporting initial model in .train() mode to handle BatchNorm.")
         save_model(current_model, 0, args)
         model_info_before_training = find_latest_model_file()
 
     else:
-        # --- 发现已有模型，判断结构是否一致 ---
         print(f"找到最新模型: {latest_model_info['path']} (第 {latest_model_info['epoch']} 轮)")
         start_epoch = latest_model_info['epoch'] + 1
         model_info_before_training = latest_model_info
 
         config_blocks = args['num_res_blocks']
         config_hidden = args['num_hidden']
+        config_channels = args['num_channels']
 
+        # 检查架构时，同时检查通道数
         is_same_architecture = (latest_model_info['res_blocks'] == config_blocks and
-                                latest_model_info['hidden_units'] == config_hidden)
+                                latest_model_info['hidden_units'] == config_hidden and
+                                latest_model_info['channels'] == config_channels)
 
         if is_same_architecture:
-            # --- 情况二：结构一致，直接续训 ---
             print("模型结构与当前配置一致，直接加载权重继续训练。")
             try:
                 current_model.load_state_dict(torch.load(latest_model_info['path'], map_location=device))
@@ -422,31 +459,24 @@ if __name__ == '__main__':
                 print(f"加载权重失败: {e}，将从随机权重开始。")
                 start_epoch = 1
         else:
-            # --- 情况三：结构不一致，执行自动迁移学习 ---
             print("模型结构与当前配置不一致，将执行自动迁移学习。")
-            print(f"  旧结构: {latest_model_info['res_blocks']} res_blocks, {latest_model_info['hidden_units']} hidden")
-            print(f"  新结构: {config_blocks} res_blocks, {config_hidden} hidden")
+            print(
+                f"  旧结构: {latest_model_info['res_blocks']} res_blocks, {latest_model_info['hidden_units']} hidden, {latest_model_info.get('channels', 'N/A')} channels")
+            print(f"  新结构: {config_blocks} res_blocks, {config_hidden} hidden, {config_channels} channels")
             try:
                 current_model = transfer_weights(current_model, latest_model_info['path'])
 
-                # 为迁移学习后的新模型也创建一个 .pt 文件，以便下一轮C++自对弈能找到它
-                epoch_for_pt_saving = latest_model_info['epoch']
-                base_filename = f"model_{epoch_for_pt_saving}_{config_blocks}x{config_hidden}"
-                print(f"为迁移学习后的新模型创建 .pt 文件: {base_filename}.pt")
-
-                current_model.eval()
-                example_input = torch.rand(1, 6, args['board_size'], args['board_size']).to(device)
-                traced_script_module = torch.jit.trace(current_model, example_input)
-                traced_script_module.save(f"{base_filename}.pt")
+                # 触发现有模型的保存，以生成匹配当前结构的 .pt 文件
+                # 这一步对于C++引擎在下一轮正确加载模型至关重要
+                print("为迁移学习后的新模型创建匹配的 .pt 文件...")
+                save_model(current_model, latest_model_info['epoch'], args)
 
             except Exception as e:
                 print(f"迁移学习失败: {e}，将从随机权重开始训练新结构模型。")
 
-    # 4. 开始训练流程
     coach = Coach(current_model, args)
     coach.learn(start_epoch=start_epoch)
 
-    # 5. 训练后评估
     model_info_after_training = find_latest_model_file()
 
     if model_info_before_training and model_info_after_training and \
@@ -455,7 +485,6 @@ if __name__ == '__main__':
     else:
         print("\n未进行有效的新一轮训练或未找到旧模型，跳过评估。")
 
-    # 6. 内存清理 (这部分逻辑和您原来的一样)
     print("\n训练全部完成，正在手动清理内存...")
     if 'coach' in locals() and hasattr(coach, 'training_data'):
         coach.training_data.clear()

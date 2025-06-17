@@ -14,7 +14,7 @@ public:
     InferenceEngine(const std::string& model_path, bool use_gpu);
 
     // 核心功能：接收一批游戏状态，返回一批推理结果
-    InferenceResult infer(const std::vector<std::vector<float>>& batch_states);
+     InferenceResult infer(const std::vector<std::vector<float>>& batch_states, int board_size, int num_channels);
 
 private:
     torch::jit::script::Module module_; // 用于存储加载的TorchScript模型

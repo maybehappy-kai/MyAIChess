@@ -43,6 +43,10 @@ private:
     int num_workers_;
     int num_simulations_;
     int mcts_batch_size_;      // MCTS推理时的批处理大小
+    int board_size_;
+        int num_rounds_;
+        int history_steps_;
+        int num_channels_;
 
     double dirichlet_alpha_;   // <--- 【新增此行】
         double dirichlet_epsilon_; // <--- 【新增此行】
@@ -92,6 +96,9 @@ private:
     int num_workers_;
     int num_simulations_;
     int evaluation_mode_; // <-- 新增成员变量
+    int board_size_;
+        int num_rounds_;
+        int num_channels_;
 
     // 用于存储结果的线程安全成员
     std::mutex results_mutex_;

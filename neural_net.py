@@ -43,14 +43,16 @@ class ResBlock(nn.Module):
 
 class ExtendedConnectNet(nn.Module):
     # (这个类本身无需改动，因为它引用的ResBlock已经被我们升级了)
-    def __init__(self, board_size=9, num_res_blocks=5, num_hidden=128):
+    def __init__(self, board_size=9, num_res_blocks=5, num_hidden=128, num_channels=20):
         super().__init__()
         self.board_size = board_size
-        self.start_block = nn.Sequential(nn.Conv2d(6, num_hidden, kernel_size=3, padding=1), nn.BatchNorm2d(num_hidden), nn.ReLU())
+        self.start_block = nn.Sequential(nn.Conv2d(num_channels, num_hidden, kernel_size=3, padding=1),
+                                         nn.BatchNorm2d(num_hidden), nn.ReLU())
         self.backbone = nn.ModuleList([ResBlock(num_hidden) for _ in range(num_res_blocks)])
-        self.policy_head = nn.Sequential(nn.Conv2d(num_hidden, 32, kernel_size=1), nn.BatchNorm2d(32), nn.ReLU(), nn.Flatten(), nn.Linear(32 * board_size * board_size, board_size * board_size))
-        self.value_head = nn.Sequential(nn.Conv2d(num_hidden, 3, kernel_size=1), nn.BatchNorm2d(3), nn.ReLU(), nn.Flatten(), nn.Linear(3 * board_size * board_size, 1), nn.Tanh())
-
+        self.policy_head = nn.Sequential(nn.Conv2d(num_hidden, 32, kernel_size=1), nn.BatchNorm2d(32), nn.ReLU(),
+                                         nn.Flatten(), nn.Linear(32 * board_size * board_size, board_size * board_size))
+        self.value_head = nn.Sequential(nn.Conv2d(num_hidden, 3, kernel_size=1), nn.BatchNorm2d(3), nn.ReLU(),
+                                        nn.Flatten(), nn.Linear(3 * board_size * board_size, 1), nn.Tanh())
     def forward(self, x):
         x = self.start_block(x)
         for res_block in self.backbone: x = res_block(x)

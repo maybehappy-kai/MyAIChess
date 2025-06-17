@@ -171,6 +171,9 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
                 this->threat_detection_bonus_ = args["threat_detection_bonus"].cast<float>();
                 this->enable_territory_heuristic_ = args["enable_territory_heuristic"].cast<bool>();
                 this->territory_heuristic_weight_ = args["territory_heuristic_weight"].cast<double>();
+                this->board_size_ = args.contains("board_size") ? args["board_size"].cast<int>() : 9;
+                    this->num_rounds_ = args.contains("num_rounds") ? args["num_rounds"].cast<int>() : 25;
+                    this->history_steps_ = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
 }
 // ===============================================================
 
@@ -246,7 +249,7 @@ void SelfPlayManager::worker_func(int worker_id) {
         }
 
         try {
-            Gomoku game;
+            Gomoku game(this->board_size_, this->num_rounds_, this->history_steps_);
             std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
             const int action_size = game.get_board_size() * game.get_board_size();
 
@@ -287,7 +290,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                     }
 
                     // 1b. 对批次进行神经网络推理
-                    auto [policy_batch, value_batch] = engine_->infer(state_batch);
+                    auto [policy_batch, value_batch] = engine_->infer(state_batch, this->board_size_, this->num_channels_);
 
                     // 1c. 扩展和反向传播批次中的每一个叶子节点
                     for (size_t k = 0; k < leaves_batch.size(); ++k) {
@@ -528,6 +531,8 @@ EvaluationManager::EvaluationManager(std::shared_ptr<InferenceEngine> engine1, s
     num_total_games_ = args["num_eval_games"].cast<int>();
     num_workers_ = args["num_cpu_threads"].cast<int>();
     num_simulations_ = args["num_eval_simulations"].cast<int>();
+    this->board_size_ = args.contains("board_size") ? args["board_size"].cast<int>() : 9;
+        this->num_rounds_ = args.contains("num_rounds") ? args["num_rounds"].cast<int>() : 25;
     scores_[1] = 0;
     scores_[-1] = 0;
     scores_[0] = 0;
@@ -562,7 +567,7 @@ void EvaluationManager::worker_func(int worker_id) {
             break;
         }
 
-        Gomoku game;
+        Gomoku game(this->board_size_, this->num_rounds_, 0);
         // ====================== 核心逻辑修改 ======================
                 auto& p1_engine = engine1_; // Model 1 默认执黑 (Player 1)
                 auto& p2_engine = engine2_; // Model 2 默认执白 (Player 2)
@@ -616,7 +621,7 @@ void EvaluationManager::worker_func(int worker_id) {
                 }
 
                 // 使用当前玩家对应的C++推理引擎
-                auto [policy_batch, value_batch] = current_engine->infer(state_batch);
+                auto [policy_batch, value_batch] = current_engine->infer(state_batch, this->board_size_, this->num_channels_);
 
                 for (size_t i = 0; i < leaves.size(); ++i) {
                     leaves[i]->expand(policy_batch[i]);
@@ -770,7 +775,9 @@ int find_best_action_for_state(
         for (const auto* leaf : leaves) {
             state_batch.push_back(leaf->game_state_.get_state());
         }
-        auto [policy_batch, value_batch] = engine->infer(state_batch);
+        int history_steps = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
+                int num_channels = (history_steps + 1) * 4 + 4;
+                auto [policy_batch, value_batch] = engine->infer(state_batch, board_size, num_channels);
         for (size_t i = 0; i < leaves.size(); ++i) {
             Node* leaf = leaves[i];
             leaf->expand(policy_batch[i]);
