@@ -174,6 +174,7 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
                 this->board_size_ = args.contains("board_size") ? args["board_size"].cast<int>() : 9;
                     this->num_rounds_ = args.contains("num_rounds") ? args["num_rounds"].cast<int>() : 25;
                     this->history_steps_ = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
+                    this->num_channels_ = args["num_channels"].cast<int>();
 }
 // ===============================================================
 
@@ -533,6 +534,7 @@ EvaluationManager::EvaluationManager(std::shared_ptr<InferenceEngine> engine1, s
     num_simulations_ = args["num_eval_simulations"].cast<int>();
     this->board_size_ = args.contains("board_size") ? args["board_size"].cast<int>() : 9;
         this->num_rounds_ = args.contains("num_rounds") ? args["num_rounds"].cast<int>() : 25;
+        this->num_channels_ = (args["history_steps"].cast<int>() + 1) * 4 + 4;
     scores_[1] = 0;
     scores_[-1] = 0;
     scores_[0] = 0;
