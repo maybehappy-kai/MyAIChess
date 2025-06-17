@@ -7,13 +7,13 @@
 #include <iostream> // 为了 std::cout
 
 // 构造函数
-Node::Node(Gomoku game_state, Node* parent, int action_taken, float prior)
+Node::Node(std::shared_ptr<const Gomoku> game_state, Node* parent, int action_taken, float prior)
     : parent_(parent),
       action_taken_(action_taken),
       prior_(prior),
       visit_count_(0),
       value_sum_(0.0),
-      game_state_(std::move(game_state)) {}
+      game_state_(std::move(game_state)) {} // <-- 现在这里移动的是一个轻量的指针
 
 Node::~Node() {
     // 使用循环销毁子节点，避免递归引起的栈溢出
@@ -82,7 +82,7 @@ double Node::get_ucb(const Node* child) const {
 
 // ===================== 这是最终的、绝对正确的解决方案 =====================
 void Node::expand(const std::vector<float>& policy) {
-    const auto valid_moves = game_state_.get_valid_moves();
+    /*const auto valid_moves = game_state_.get_valid_moves();
     children_.reserve(policy.size());
 
     for (size_t action = 0; action < policy.size(); ++action) {
@@ -100,7 +100,7 @@ void Node::expand(const std::vector<float>& policy) {
             // 为了更清晰，我们也可以直接传递一个拷贝。
             children_.push_back(std::make_unique<Node>(next_game_state, this, action, policy[action]));
         }
-    }
+    }*/
 }
 // ===================== 修改结束 =====================
 

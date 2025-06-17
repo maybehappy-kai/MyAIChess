@@ -256,7 +256,8 @@ void SelfPlayManager::worker_func(int worker_id) {
 
             // ====================== 单局游戏主循环 ======================
             while (true) {
-                auto root = std::make_unique<Node>(game);
+                auto initial_state_ptr = std::make_shared<const Gomoku>(game);
+                auto root = std::make_unique<Node>(initial_state_ptr, nullptr, -1, 1.0f);
 
                 // === 1. 正确的MCTS批处理搜索 ===
                 const int num_simulations = this->num_simulations_;
@@ -276,13 +277,13 @@ void SelfPlayManager::worker_func(int worker_id) {
                             node = node->select_child();
                         }
 
-                        auto [end_value, is_terminal] = node->game_state_.get_game_ended();
+                        auto [end_value, is_terminal] = node->game_state_->get_game_ended();
                         if (is_terminal) {
-                            double value_to_propagate = end_value * node->game_state_.get_current_player();
+                            double value_to_propagate = end_value * node->game_state_->get_current_player();
                             node->backpropagate(value_to_propagate);
                         } else {
                             leaves_batch.push_back(node);
-                            state_batch.push_back(node->game_state_.get_state());
+                            state_batch.push_back(node->game_state_->get_state());
                         }
                     }
 
@@ -298,31 +299,24 @@ void SelfPlayManager::worker_func(int worker_id) {
                         Node* leaf = leaves_batch[k];
                         auto current_policy = policy_batch[k];
 
-                        // 如果叶子节点是根节点 (parent_ is null)
-                        if (leaf->parent_ == nullptr) {
-                            // --- 修改开始: 注入先验知识 ---
-                            // 仅在游戏第一步 (move_number is 0) 且开关为True时生效
-                            if (this->enable_opening_bias_ && leaf->game_state_.get_move_number() == 0) { // <--- 修改点
-                                    const int board_size = leaf->game_state_.get_board_size();
-                                    float bias_strength = this->opening_bias_strength_; // <--- 修改点
+                        // ====================== 在此注入您的完整逻辑 ======================
+                        if (leaf->parent_ == nullptr) { // 只对根节点操作
+                            // --- 注入开局偏置 ---
+                            if (this->enable_opening_bias_ && leaf->game_state_->get_move_number() == 0) {
+                                const int board_size = leaf->game_state_->get_board_size();
+                                float bias_strength = this->opening_bias_strength_;
                                 std::vector<float> opening_bias(board_size * board_size, 0.0f);
-
-                                // 计算中心偏置
                                 for (int r = 0; r < board_size; ++r) {
                                     for (int c = 0; c < board_size; ++c) {
-                                        // 计算到最近边界的距离
                                         int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
                                         float bias = 0.0f;
-                                        if (dist_from_edge == 0) bias = 0.1f; // 边界
-                                        else if (dist_from_edge == 1) bias = 0.4f; // 次边界
-                                        else if (dist_from_edge == 2) bias = 0.8f; // 第三格，明显增大
-                                        else bias = 1.0f; // 更靠近中心，增速放缓
-
+                                        if (dist_from_edge == 0) bias = 0.1f;
+                                        else if (dist_from_edge == 1) bias = 0.4f;
+                                        else if (dist_from_edge == 2) bias = 0.8f;
+                                        else bias = 1.0f;
                                         opening_bias[r * board_size + c] = bias;
                                     }
                                 }
-
-                                // 将偏置添加到策略中并重新归一化
                                 float policy_sum = 0.0f;
                                 for(size_t i = 0; i < current_policy.size(); ++i) {
                                     current_policy[i] += bias_strength * opening_bias[i];
@@ -334,35 +328,48 @@ void SelfPlayManager::worker_func(int worker_id) {
                                     }
                                 }
                             }
-                            // --- 修改结束 ---
 
-                            // --- 新增：调用威胁检测 ---
-                                if (this->enable_threat_detection_) { // <--- 修改点
-                                        float bonus = this->threat_detection_bonus_; // <--- 修改点
-                                        apply_threat_detection_bias(current_policy, leaf->game_state_, bonus);
-                                    }
-                                // --- 新增结束 ---
+                            // --- 调用威胁检测 ---
+                            if (this->enable_threat_detection_) {
+                                float bonus = this->threat_detection_bonus_;
+                                // 注意：apply_threat_detection_bias 需要一个Gomoku对象引用，所以我们用 * 解引用指针
+                                apply_threat_detection_bias(current_policy, *leaf->game_state_, bonus);
+                            }
 
-                            // *** 保留功能点：狄利克雷噪声 ***
+                            // --- 添加狄利克雷噪声 ---
                             add_dirichlet_noise(
                                 current_policy,
-                                leaf->game_state_.get_valid_moves(),
+                                leaf->game_state_->get_valid_moves(), // 注意这里是 ->
                                 this->dirichlet_alpha_,
                                 this->dirichlet_epsilon_
                             );
                         }
+                        // ====================== 注入逻辑结束 ======================
 
-                        leaf->expand(current_policy);
+                        // 【统一的扩展逻辑】使用可能已被修改过的 current_policy 来创建子节点
+                        const auto& parent_state = *leaf->game_state_;
+                        const auto valid_moves = parent_state.get_valid_moves();
+                        leaf->children_.reserve(valid_moves.size());
+
+                        for (size_t action = 0; action < current_policy.size(); ++action) {
+                            if (current_policy[action] > 0.0f && valid_moves[action]) {
+                                auto next_game_state = std::make_shared<Gomoku>(parent_state);
+                                next_game_state->execute_move(action);
+                                leaf->children_.push_back(std::make_unique<Node>(
+                                    next_game_state, leaf, action, current_policy[action]
+                                ));
+                            }
+                        }
                         // --- 修改开始: 混合价值启发 ---
                             double nn_value = static_cast<double>(value_batch[k]);
                             double final_value = nn_value;
 
                             if (this->enable_territory_heuristic_) { // <--- 修改点
                                 double weight = this->territory_heuristic_weight_; // <--- 修改点
-                                const int board_size = leaf->game_state_.get_board_size();
+                                const int board_size = leaf->game_state_->get_board_size();
 
                                 // 计算归一化的领地分数作为启发值 (-1.0 to 1.0)
-                                double territory_score = static_cast<double>(leaf->game_state_.get_territory_score());
+                                double territory_score = static_cast<double>(leaf->game_state_->get_territory_score());
                                 double heuristic_value = territory_score / (board_size * board_size);
 
                                 // 加权平均
@@ -410,7 +417,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                                 }*/
                                 // ==================== 验证日志 结束 ====================
 
-                episode_data.emplace_back(root->game_state_.get_state(), action_probs, game.get_current_player());
+                episode_data.emplace_back(root->game_state_->get_state(), action_probs, game.get_current_player());
 
                 // === 3. ***保留功能点：温度采样和最终动作选择*** ===
                 int action = -1;
@@ -597,7 +604,8 @@ void EvaluationManager::worker_func(int worker_id) {
             int current_player = game.get_current_player();
             auto& current_engine = models.at(current_player);
 
-            auto root = std::make_unique<Node>(game);
+            auto initial_state_ptr = std::make_shared<const Gomoku>(game);
+            auto root = std::make_unique<Node>(initial_state_ptr, nullptr, -1, 1.0f);
 
             // MCTS 搜索过程 (与自对弈类似，但使用C++推理引擎)
             std::vector<Node*> leaves;
@@ -605,9 +613,9 @@ void EvaluationManager::worker_func(int worker_id) {
             for (int i = 0; i < num_simulations_; ++i) {
                 Node* node = root.get();
                 while (node->is_fully_expanded()) node = node->select_child();
-                auto [end_value, is_terminal] = node->game_state_.get_game_ended();
+                auto [end_value, is_terminal] = node->game_state_->get_game_ended();
                 if (is_terminal) {
-                    node->backpropagate(end_value * node->game_state_.get_current_player());
+                    node->backpropagate(end_value * node->game_state_->get_current_player());
                     continue;
                 }
                 leaves.push_back(node);
@@ -619,16 +627,31 @@ void EvaluationManager::worker_func(int worker_id) {
                 std::vector<std::vector<float>> state_batch;
                 state_batch.reserve(leaves.size());
                 for (const auto* leaf : leaves) {
-                    state_batch.push_back(leaf->game_state_.get_state());
+                    state_batch.push_back(leaf->game_state_->get_state());
                 }
 
                 // 使用当前玩家对应的C++推理引擎
                 auto [policy_batch, value_batch] = current_engine->infer(state_batch, this->board_size_, this->num_channels_);
 
                 for (size_t i = 0; i < leaves.size(); ++i) {
-                    leaves[i]->expand(policy_batch[i]);
-                    leaves[i]->backpropagate(static_cast<double>(value_batch[i]));
-                }
+                        Node* leaf = leaves[i];
+                        const auto& current_policy = policy_batch[i];
+
+                        // 使用新的扩展逻辑，替换旧的 expand 调用
+                        const auto& parent_state = *leaf->game_state_;
+                        const auto valid_moves = parent_state.get_valid_moves();
+                        leaf->children_.reserve(valid_moves.size());
+                        for (size_t action = 0; action < current_policy.size(); ++action) {
+                            if (current_policy[action] > 0.0f && valid_moves[action]) {
+                                auto next_game_state = std::make_shared<Gomoku>(parent_state);
+                                next_game_state->execute_move(action);
+                                leaf->children_.push_back(std::make_unique<Node>(
+                                    next_game_state, leaf, action, current_policy[action]
+                                ));
+                            }
+                        }
+                        leaf->backpropagate(static_cast<double>(value_batch[i]));
+                    }
             }
 
             // in EvaluationManager::worker_func
@@ -750,7 +773,8 @@ int find_best_action_for_state(
     );
 
     int num_simulations = args["num_searches"].cast<int>();
-    auto root = std::make_unique<Node>(game);
+    auto initial_state_ptr = std::make_shared<const Gomoku>(game);
+    auto root = std::make_unique<Node>(initial_state_ptr, nullptr, -1, 1.0f);
 
     std::vector<Node*> leaves;
     leaves.reserve(num_simulations);
@@ -759,10 +783,10 @@ int find_best_action_for_state(
         while (node->is_fully_expanded()) {
             node = node->select_child();
         }
-        auto [end_value, is_terminal] = node->game_state_.get_game_ended();
+        auto [end_value, is_terminal] = node->game_state_->get_game_ended();
         double value_to_propagate = end_value;
         if (is_terminal) {
-            value_to_propagate *= node->game_state_.get_current_player();
+            value_to_propagate *= node->game_state_->get_current_player();
             node->backpropagate(value_to_propagate);
             continue;
         }
@@ -775,16 +799,31 @@ int find_best_action_for_state(
         std::vector<std::vector<float>> state_batch;
         state_batch.reserve(leaves.size());
         for (const auto* leaf : leaves) {
-            state_batch.push_back(leaf->game_state_.get_state());
+            state_batch.push_back(leaf->game_state_->get_state());
         }
         int history_steps = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
                 int num_channels = (history_steps + 1) * 4 + 4;
                 auto [policy_batch, value_batch] = engine->infer(state_batch, board_size, num_channels);
         for (size_t i = 0; i < leaves.size(); ++i) {
-            Node* leaf = leaves[i];
-            leaf->expand(policy_batch[i]);
-            leaf->backpropagate(static_cast<double>(value_batch[i]));
-        }
+                Node* leaf = leaves[i];
+                const auto& current_policy = policy_batch[i];
+
+                // 使用新的扩展逻辑，替换旧的 expand 调用
+                // 注意：人机对战模式通常不使用狄利克雷噪声或开局偏置，所以直接扩展
+                const auto& parent_state = *leaf->game_state_;
+                const auto valid_moves = parent_state.get_valid_moves();
+                leaf->children_.reserve(valid_moves.size());
+                for (size_t action = 0; action < current_policy.size(); ++action) {
+                    if (current_policy[action] > 0.0f && valid_moves[action]) {
+                        auto next_game_state = std::make_shared<Gomoku>(parent_state);
+                        next_game_state->execute_move(action);
+                        leaf->children_.push_back(std::make_unique<Node>(
+                            next_game_state, leaf, action, current_policy[action]
+                        ));
+                    }
+                }
+                leaf->backpropagate(static_cast<double>(value_batch[i]));
+            }
     }
 
     // in find_best_action_for_state

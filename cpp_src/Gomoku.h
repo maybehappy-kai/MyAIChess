@@ -62,9 +62,9 @@ private:
 
     // vvvvvv 修改成员变量 vvvvvv
     // 私有成员变量
-    int board_size_;
-    int max_total_moves_;
-    int history_steps_; // 新增：存储历史步数
+    const int board_size_;
+    const int max_total_moves_;
+    const int history_steps_; // 新增：存储历史步数
 
     int current_player_;
     int current_move_number_;
