@@ -734,7 +734,8 @@ void EvaluationManager::worker_func(int worker_id) {
     }
 }
 
-// 这是修正后的 find_best_action_for_state 函数
+// file: cpp_src/SelfPlayManager.cpp (修改内容)
+
 int find_best_action_for_state(
     py::list py_board_pieces,
     py::list py_board_territory,
@@ -746,70 +747,88 @@ int find_best_action_for_state(
 {
     py::gil_scoped_release release;
 
-    // ★★★ 核心修正：不再直接创建新引擎，而是从我们专用的缓存中获取 ★★★
     auto engine = get_cached_engine(model_path, use_gpu);
-
-    // --- 后续所有逻辑与您提供的版本完全相同，保持不变 ---
 
     int board_size = args["board_size"].cast<int>();
     int max_total_moves = args.contains("max_total_moves") ? args["max_total_moves"].cast<int>() : 50;
+    int history_steps = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
 
-    std::vector<std::vector<int>> pieces_vec;
-    for (auto r : py_board_pieces) {
-        pieces_vec.push_back(r.cast<std::vector<int>>());
+    // ====================== 【核心修改】将Python list转换为位棋盘 ======================
+    uint64_t black_s[2] = {0,0}, white_s[2] = {0,0}, black_t[2] = {0,0}, white_t[2] = {0,0};
+
+    // 转换棋子
+    for (int r = 0; r < board_size; ++r) {
+        py::list row = py_board_pieces[r].cast<py::list>();
+        for (int c = 0; c < board_size; ++c) {
+            int piece = row[c].cast<int>();
+            if (piece == 0) continue;
+            int pos = r * board_size + c;
+            int index = pos / 64;
+            uint64_t mask = 1ULL << (pos % 64);
+            if (piece == 1) black_s[index] |= mask;
+            else white_s[index] |= mask;
+        }
     }
-    std::vector<std::vector<int>> territory_vec;
-    for (auto r : py_board_territory) {
-        territory_vec.push_back(r.cast<std::vector<int>>());
+    // 转换领地
+    for (int r = 0; r < board_size; ++r) {
+        py::list row = py_board_territory[r].cast<py::list>();
+        for (int c = 0; c < board_size; ++c) {
+            int territory = row[c].cast<int>();
+            if (territory == 0) continue;
+            int pos = r * board_size + c;
+            int index = pos / 64;
+            uint64_t mask = 1ULL << (pos % 64);
+            if (territory == 1) black_t[index] |= mask;
+            else white_t[index] |= mask;
+        }
     }
 
+    // 调用我们新的构造函数
     Gomoku game(
-        board_size,
-        max_total_moves,
-        current_player,
-        current_move_number,
-        pieces_vec,
-        territory_vec
+        board_size, max_total_moves, current_player, current_move_number,
+        black_s, white_s, black_t, white_t, history_steps
     );
+    // ===============================================================================
 
     int num_simulations = args["num_searches"].cast<int>();
+    // 后续的 MCTS 逻辑与 EvaluationManager::worker_func 中的完全相同
     auto initial_state_ptr = std::make_shared<const Gomoku>(game);
     auto root = std::make_unique<Node>(initial_state_ptr, nullptr, -1, 1.0f);
 
-    std::vector<Node*> leaves;
-    leaves.reserve(num_simulations);
-    for (int i = 0; i < num_simulations; ++i) {
-        Node* node = root.get();
-        while (node->is_fully_expanded()) {
-            node = node->select_child();
-        }
-        auto [end_value, is_terminal] = node->game_state_->get_game_ended();
-        double value_to_propagate = end_value;
-        if (is_terminal) {
-            value_to_propagate *= node->game_state_->get_current_player();
-            node->backpropagate(value_to_propagate);
-            continue;
-        }
-        leaves.push_back(node);
-    }
+    std::vector<Node*> leaves_batch;
+    // file: cpp_src/SelfPlayManager.cpp (find_best_action_for_state 的 MCTS 循环)
 
-    if (!leaves.empty()) {
-        std::sort(leaves.begin(), leaves.end());
-        leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
-        std::vector<std::vector<float>> state_batch;
-        state_batch.reserve(leaves.size());
-        for (const auto* leaf : leaves) {
-            state_batch.push_back(leaf->game_state_->get_state());
+        std::vector<Node*> leaves_batch;
+        leaves_batch.reserve(num_simulations);
+        for (int i = 0; i < num_simulations; ++i) {
+            Node* node = root.get();
+            while (node->is_fully_expanded()) {
+                node = node->select_child();
+            }
+            auto [end_value, is_terminal] = node->game_state_->get_game_ended();
+            if (is_terminal) {
+                node->backpropagate(end_value * node->game_state_->get_current_player());
+                continue;
+            }
+            leaves_batch.push_back(node);
         }
-        int history_steps = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
-                int num_channels = (history_steps + 1) * 4 + 4;
-                auto [policy_batch, value_batch] = engine->infer(state_batch, board_size, num_channels);
-        for (size_t i = 0; i < leaves.size(); ++i) {
-                Node* leaf = leaves[i];
+
+        if (!leaves_batch.empty()) {
+            std::sort(leaves_batch.begin(), leaves_batch.end());
+            leaves_batch.erase(std::unique(leaves_batch.begin(), leaves_batch.end()), leaves_batch.end());
+
+            std::vector<std::vector<float>> state_batch;
+            state_batch.reserve(leaves_batch.size());
+            for (const auto* leaf : leaves_batch) {
+                state_batch.push_back(leaf->game_state_->get_state());
+            }
+
+            int num_channels = (history_steps + 1) * 4 + 4;
+            auto [policy_batch, value_batch] = engine->infer(state_batch, board_size, num_channels);
+
+            for (size_t i = 0; i < leaves_batch.size(); ++i) {
+                Node* leaf = leaves_batch[i];
                 const auto& current_policy = policy_batch[i];
-
-                // 使用新的扩展逻辑，替换旧的 expand 调用
-                // 注意：人机对战模式通常不使用狄利克雷噪声或开局偏置，所以直接扩展
                 const auto& parent_state = *leaf->game_state_;
                 const auto valid_moves = parent_state.get_valid_moves();
                 leaf->children_.reserve(valid_moves.size());
@@ -824,66 +843,43 @@ int find_best_action_for_state(
                 }
                 leaf->backpropagate(static_cast<double>(value_batch[i]));
             }
-    }
+        }
 
-    // in find_best_action_for_state
-
-    // --- 修改开始 ---
-    int action = -1;
-    if (!root->children_.empty()) {
-        int max_visits = -1;
-        for (const auto& child : root->children_) {
-            if (child && child->visit_count_ > max_visits) {
-                max_visits = child->visit_count_;
+        // 选择最佳动作的逻辑
+        int action = -1;
+        if (!root->children_.empty()) {
+            int max_visits = -1;
+            for (const auto& child : root->children_) {
+                if (child && child->visit_count_ > max_visits) {
+                    max_visits = child->visit_count_;
+                }
+            }
+            std::vector<int> best_actions;
+            for (const auto& child : root->children_) {
+                if (child && child->visit_count_ == max_visits) {
+                    best_actions.push_back(child->action_taken_);
+                }
+            }
+            if (!best_actions.empty()) {
+                std::random_device rd;
+                std::mt19937 gen(rd());
+                std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
+                action = best_actions[dist(gen)];
             }
         }
 
-        std::vector<int> best_actions;
-        for (const auto& child : root->children_) {
-            if (child && child->visit_count_ == max_visits) {
-                best_actions.push_back(child->action_taken_);
+        if (action == -1) {
+            auto valid_moves = game.get_valid_moves();
+            std::vector<int> valid_move_indices;
+            for (size_t i = 0; i < valid_moves.size(); ++i) {
+                if (valid_moves[i]) valid_move_indices.push_back(i);
+            }
+            if (!valid_move_indices.empty()) {
+                std::random_device rd;
+                std::mt19937 gen(rd());
+                std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
+                action = valid_move_indices[distrib(gen)];
             }
         }
-
-        if (!best_actions.empty()) {
-            // 从所有最佳动作中随机选择一个
-            // 注意：这里我们创建一个临时的生成器，因为此函数可能被频繁调用
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
-            action = best_actions[dist(gen)];
-        }
-    }
-    // --- 修改结束 ---
-
-    // 建议的修改 in cpp_src/SelfPlayManager.cpp
-    if (action == -1) {
-       // ==================== 新增诊断日志 开始 ====================
-               {
-                   // 使用 g_io_mutex 来确保线程安全的输出
-                   std::lock_guard<std::mutex> lock(g_io_mutex);
-                   std::cerr << "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
-                             << "[AI FALLBACK] MCTS search FAILED for player " << current_player
-                             << " on move " << current_move_number
-                             << ".\n"
-                             << "              Triggering FALLBACK logic: finding first valid move from top-left.\n"
-                             << "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n" << std::endl;
-               }
-               // ==================== 新增诊断日志 结束 ====================
-        auto valid_moves = game.get_valid_moves();
-        std::vector<int> valid_move_indices;
-        for (size_t i = 0; i < valid_moves.size(); ++i) {
-            if (valid_moves[i]) {
-                valid_move_indices.push_back(i);
-            }
-        }
-        if (!valid_move_indices.empty()) {
-            // 如果别无选择，至少随机选一个，而不是永远选第一个
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
-            action = valid_move_indices[distrib(gen)];
-        }
-    }
-    return action;
+        return action;
 }
