@@ -1,4 +1,4 @@
-// file: cpp_src/Gomoku.cpp (最终修正版)
+// file: cpp_src/Gomoku.cpp (绝对最终版)
 
 #include "Gomoku.h"
 #include <iostream>
@@ -17,7 +17,7 @@
 #endif
 
 // ===================================================================
-// 构造函数与析构/拷贝函数
+// 构造函数与拷贝/赋值函数
 // ===================================================================
 
 Gomoku::Gomoku(int board_size, int num_rounds, int history_steps)
@@ -78,6 +78,7 @@ Gomoku::Gomoku(const Gomoku& other)
 
 Gomoku& Gomoku::operator=(const Gomoku& other) {
     if (this != &other) {
+        // const 成员变量不能被赋值，所以它们保持不变
         current_player_ = other.current_player_;
         current_move_number_ = other.current_move_number_;
         last_move_action_ = other.last_move_action_;
@@ -202,6 +203,7 @@ std::vector<bool> Gomoku::get_valid_moves() const {
     uint64_t occupied[2] = { black_stones_[0] | white_stones_[0], black_stones_[1] | white_stones_[1] };
     const uint64_t* opponent_territory = (current_player_ == PLAYER_BLACK) ? white_territory_ : black_territory_;
     uint64_t valid_mask[2] = { ~(occupied[0] | opponent_territory[0]), ~(occupied[1] | opponent_territory[1]) };
+
     for (int i = 0; i < board_size_ * board_size_; ++i) {
         const int index = i / 64;
         const uint64_t mask = 1ULL << (i % 64);
@@ -265,7 +267,9 @@ std::vector<float> Gomoku::get_state() const {
         const uint64_t* territory_prev = (last_player == PLAYER_BLACK) ? prev_board.black_territory : prev_board.white_territory;
         uint64_t changed[2] = { territory_curr[0] & ~territory_prev[0], territory_curr[1] & ~territory_prev[1] };
         for (int i = 0; i < plane_size; ++i) {
-            if (changed[i / 64] & (1ULL << (i % 64))) {
+            const int index = i / 64;
+            const uint64_t mask = 1ULL << (i % 64);
+            if (changed[index] & mask) {
                 state[(meta_offset + 3) * plane_size + i] = 1.0f;
             }
         }
@@ -294,6 +298,7 @@ bool Gomoku::is_on_board(int r, int c) const {
     return r >= 0 && r < board_size_ && c >= 0 && c < board_size_;
 }
 
+// 【最终修正】确保此函数被正确实现为Gomoku类的成员
 bool Gomoku::is_occupied(int r, int c) const {
     const int pos = r * board_size_ + c;
     const int index = pos / 64;
@@ -301,6 +306,7 @@ bool Gomoku::is_occupied(int r, int c) const {
     return (black_stones_[index] & mask) || (white_stones_[index] & mask);
 }
 
+// 【最终修正】重写print_board以支持位棋盘
 void Gomoku::print_board() const {
     std::cout << "--- Board (Player: " << (current_player_ == 1 ? "B" : "W") << ", Move: " << current_move_number_ << ") ---" << std::endl;
     for (int r = 0; r < board_size_; ++r) {
