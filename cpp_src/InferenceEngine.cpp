@@ -10,6 +10,10 @@ InferenceEngine::InferenceEngine(const std::string& model_path, bool use_gpu)
         module_ = torch::jit::load(model_path);
         // 将模型移动到指定的设备（CPU或GPU）
         module_.to(device_);
+
+        if (use_gpu) { // 半精度优化通常只在GPU上进行
+                    module_.to(torch::kHalf);
+                }
         // 切换到评估模式，这会关闭Dropout等训练特有的层
         module_.eval();
     } catch (const c10::Error& e) {
@@ -38,6 +42,10 @@ InferenceEngine::InferenceResult InferenceEngine::infer(const std::vector<std::v
     input_tensor = input_tensor.clone().to(device_);
     // --- 扁平化数据逻辑结束 ---
 
+    if (device_.is_cuda()) { // 同样只在GPU上转换
+            input_tensor = input_tensor.to(torch::kHalf);
+        }
+
     // 3. 使用传入的参数重塑Tensor，不再有任何硬编码或计算
     input_tensor = input_tensor.view({-1, num_channels, board_size, board_size});
 
@@ -48,8 +56,8 @@ InferenceEngine::InferenceResult InferenceEngine::infer(const std::vector<std::v
     at::NoGradGuard no_grad;
     auto output_tuple = module_.forward(inputs).toTuple();
 
-    torch::Tensor policy_log_probs = output_tuple->elements()[0].toTensor().to(torch::kCPU);
-    torch::Tensor values = output_tuple->elements()[1].toTensor().to(torch::kCPU);
+    torch::Tensor policy_log_probs = output_tuple->elements()[0].toTensor().to(torch::kCPU).to(torch::kFloat);
+    torch::Tensor values = output_tuple->elements()[1].toTensor().to(torch::kCPU).to(torch::kFloat);
 
     auto policies = torch::exp(policy_log_probs);
 

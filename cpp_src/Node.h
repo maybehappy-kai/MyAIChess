@@ -45,5 +45,5 @@ public: // 成员变量设为公有，方便C++ MCTS引擎直接访问，与Pyth
     // MCTS超参数，从Python端传入
     // 为简化起见，我们可以在select_child中直接传递c_puct，而不是存储整个args字典
     // 这里我们直接定义 C (c_puct) 的值，在实际的MCTS引擎调用中可以传入此值
-    static constexpr float C_PUCT = 1.5f;
+    //static constexpr float C_PUCT = 1.5f;
 };

@@ -341,16 +341,24 @@ class Coach:
             print("评估局数过少，无法进行分组评估。")
             return
 
-        base_eval_args = {
+        eval_args = {
+            # 评估专用参数
             'num_eval_games': games_per_side,
-            'num_eval_simulations': self.args['num_searches'],
-            'num_cpu_threads': self.args.get('num_cpu_threads', 18)
+            'num_eval_simulations': self.args['num_searches'],  # 使用 num_searches 的值
+            'num_cpu_threads': self.args.get('num_cpu_threads', 18),
+            'C': self.args['C'],
+
+            # C++引擎初始化Gomoku和模型所需的通用参数
+            'board_size': self.args['board_size'],
+            'num_rounds': self.args['num_rounds'],
+            'history_steps': self.args['history_steps'],
+            'num_channels': self.args['num_channels']  # C++端也需要通道数
         }
 
         # --- 实验一：新模型执先手 (Model 2) ---
         print(f"\n[实验一] 新模型执黑，进行 {games_per_side} 局...")
         results1 = cpp_mcts_engine.run_parallel_evaluation(
-            model1_pt_path, model2_pt_path, use_gpu, base_eval_args, mode=2
+            model1_pt_path, model2_pt_path, use_gpu, eval_args, mode=2
         )
         new_as_p1_wins = results1.get("model2_wins", 0)
         old_as_p2_wins = results1.get("model1_wins", 0)
@@ -359,7 +367,7 @@ class Coach:
         # --- 实验二：旧模型执先手 (Model 1) ---
         print(f"\n[实验二] 旧模型执黑，进行 {games_per_side} 局...")
         results2 = cpp_mcts_engine.run_parallel_evaluation(
-            model1_pt_path, model2_pt_path, use_gpu, base_eval_args, mode=1
+            model1_pt_path, model2_pt_path, use_gpu, eval_args, mode=1
         )
         old_as_p1_wins = results2.get("model1_wins", 0)
         new_as_p2_wins = results2.get("model2_wins", 0)

@@ -101,6 +101,7 @@ private:
     int board_size_;
         int num_rounds_;
         int num_channels_;
+        int history_steps_;
 
         double c_puct_;
 

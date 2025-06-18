@@ -207,15 +207,35 @@ class GameGUI:
         p2_text = self.font_big.render(f"{p2_score}", True, self.colors['p2']);
         self.screen.blit(p2_text, (self.screen_size[0] - 80 - p2_text.get_width(), 200))
 
-    # ★★★ 核心修正 2：AI工作函数现在只负责计算和把结果“投递”到邮箱 ★★★
+        # file: play_pixel_art.py
+
+        # ... (其他代码保持不变) ...
+
+        # ★★★ 核心修正 2：AI工作函数现在只负责计算和把结果“投递”到邮箱 ★★★
+
     def _ai_worker_func(self, board_pieces, board_territory, current_player, current_move_number):
-        ai_args = {'board_size': self.game.board_size, 'num_searches': args.get('num_searches', 400),
-                   'max_total_moves': self.game.max_total_moves}
+
+        # ====================== [核心修正] ======================
+        # 从全局 config.py 的 args 字典创建一份完整的参数副本
+        # 以确保人机对战的AI行为与训练时完全一致
+        ai_args = args.copy()
+
+        # 你可以根据需要覆盖特定参数，例如，在对战时减少搜索次数
+        # ai_args['num_searches'] = 400 # 示例：如果想在对战时降低AI强度
+
+        # C++ 引擎需要的其他参数，如 board_size 和 max_total_moves，也应更新
+        ai_args['board_size'] = self.game.board_size
+        ai_args['max_total_moves'] = self.game.max_total_moves
+        # ========================================================
+
+        # vvvvvvvv 使用完整的 ai_args 字典 vvvvvvvv
         best_action = cpp_mcts_engine.find_best_action(board_pieces, board_territory, current_player,
-                                                       current_move_number, self.model_file, self.device.type == 'cuda',
+                                                       current_move_number, self.model_file,
+                                                       self.device.type == 'cuda',
                                                        ai_args)
         self.ai_result_queue.put(best_action)
 
+    # ... (run 函数及后续代码保持不变) ...
     def run(self):
         CELL_SIZE = 60
         BOARD_START_X = (self.screen_size[0] - self.game.board_size * CELL_SIZE) // 2
@@ -234,7 +254,7 @@ class GameGUI:
                 if valid:
                     r, c = ai_action // self.game.board_size, ai_action % self.game.board_size
                     pos = (
-                    BOARD_START_X + c * CELL_SIZE + CELL_SIZE // 2, BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
+                        BOARD_START_X + c * CELL_SIZE + CELL_SIZE // 2, BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
                     self.create_effect(pos, 30, (200, 200, 255), 'burst')
                     if line_centers:
                         line_color = self.colors['p1'] if player_who_moved == 1 else self.colors['p2']
@@ -271,7 +291,7 @@ class GameGUI:
 
             # 3. 检查是否需要启动AI线程
             is_ai_turn_to_start = (
-                        self.game.current_player != self.human_player and not game_over and not self.ai_is_thinking)
+                    self.game.current_player != self.human_player and not game_over and not self.ai_is_thinking)
             if is_ai_turn_to_start:
                 self.ai_is_thinking = True
                 thread_args = (copy.deepcopy(self.game.board_pieces), copy.deepcopy(self.game.board_territory),

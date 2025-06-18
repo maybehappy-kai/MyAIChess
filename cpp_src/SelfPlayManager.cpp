@@ -535,15 +535,28 @@ py::dict run_parallel_evaluation(const std::string& model1_path, const std::stri
 }
 
 // EvaluationManager 类的实现
-EvaluationManager::EvaluationManager(std::shared_ptr<InferenceEngine> engine1, std::shared_ptr<InferenceEngine> engine2, py::dict args, int mode) // <-- 增加mode参数
-    : engine1_(engine1), engine2_(engine2), evaluation_mode_(mode) { // <-- 保存mode
+EvaluationManager::EvaluationManager(
+    std::shared_ptr<InferenceEngine> engine1,
+    std::shared_ptr<InferenceEngine> engine2,
+    py::dict args,
+    int mode)
+    : engine1_(engine1), engine2_(engine2), evaluation_mode_(mode)
+{
     num_total_games_ = args["num_eval_games"].cast<int>();
     num_workers_ = args["num_cpu_threads"].cast<int>();
     num_simulations_ = args["num_eval_simulations"].cast<int>();
-    this->board_size_ = args.contains("board_size") ? args["board_size"].cast<int>() : 9;
-        this->num_rounds_ = args.contains("num_rounds") ? args["num_rounds"].cast<int>() : 25;
-        this->num_channels_ = (args["history_steps"].cast<int>() + 1) * 4 + 4;
-        this->c_puct_ = args["C"].cast<double>();
+
+    // 直接从 args 读取，因为我们已在 Python 端确保了它们的传递
+    board_size_ = args["board_size"].cast<int>();
+    num_rounds_ = args["num_rounds"].cast<int>();
+    num_channels_ = args["num_channels"].cast<int>();
+    c_puct_ = args["C"].cast<double>();
+
+    // vvvvvvvv 这是最关键的新增行 vvvvvvvv
+    history_steps_ = args["history_steps"].cast<int>();
+    // ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+    // 初始化计分板
     scores_[1] = 0;
     scores_[-1] = 0;
     scores_[0] = 0;
@@ -578,161 +591,173 @@ void EvaluationManager::worker_func(int worker_id) {
             break;
         }
 
-        Gomoku game(this->board_size_, this->num_rounds_, 0);
-        // ====================== 核心逻辑修改 ======================
-                auto& p1_engine = engine1_; // Model 1 默认执黑 (Player 1)
-                auto& p2_engine = engine2_; // Model 2 默认执白 (Player 2)
+        try {
+                    Gomoku game(this->board_size_, this->num_rounds_, this->history_steps_);
+                            // ====================== 核心逻辑修改 ======================
+                                    auto& p1_engine = engine1_; // Model 1 默认执黑 (Player 1)
+                                    auto& p2_engine = engine2_; // Model 2 默认执白 (Player 2)
 
-                if (evaluation_mode_ == 0) { // Mode 0: 交替先后手
-                    bool swap_models = (game_idx % 2 != 0);
-                    if(swap_models) {
-                        p1_engine = engine2_;
-                        p2_engine = engine1_;
-                    }
-                } else if (evaluation_mode_ == 1) { // Mode 1: 固定 Model 1 先手
-                    // 不需要做任何事，p1_engine已经是engine1_
-                } else if (evaluation_mode_ == 2) { // Mode 2: 固定 Model 2 先手
-                    p1_engine = engine2_;
-                    p2_engine = engine1_;
-                }
-                // ========================================================
+                                    if (evaluation_mode_ == 0) { // Mode 0: 交替先后手
+                                        bool swap_models = (game_idx % 2 != 0);
+                                        if(swap_models) {
+                                            p1_engine = engine2_;
+                                            p2_engine = engine1_;
+                                        }
+                                    } else if (evaluation_mode_ == 1) { // Mode 1: 固定 Model 1 先手
+                                        // 不需要做任何事，p1_engine已经是engine1_
+                                    } else if (evaluation_mode_ == 2) { // Mode 2: 固定 Model 2 先手
+                                        p1_engine = engine2_;
+                                        p2_engine = engine1_;
+                                    }
+                                    // ========================================================
 
-        std::map<int, std::shared_ptr<InferenceEngine>> models = {
-            {1, p1_engine},
-            {-1, p2_engine}
-        };
+                            std::map<int, std::shared_ptr<InferenceEngine>> models = {
+                                {1, p1_engine},
+                                {-1, p2_engine}
+                            };
 
-        while (true) {
-            int current_player = game.get_current_player();
-            auto& current_engine = models.at(current_player);
+                            while (true) {
+                                int current_player = game.get_current_player();
+                                auto& current_engine = models.at(current_player);
 
-            auto initial_state_ptr = std::make_shared<const Gomoku>(game);
-            auto root = std::make_unique<Node>(initial_state_ptr, nullptr, -1, 1.0f);
+                                auto initial_state_ptr = std::make_shared<const Gomoku>(game);
+                                auto root = std::make_unique<Node>(initial_state_ptr, nullptr, -1, 1.0f);
 
-            // MCTS 搜索过程 (与自对弈类似，但使用C++推理引擎)
-            std::vector<Node*> leaves;
-            leaves.reserve(num_simulations_);
-            for (int i = 0; i < num_simulations_; ++i) {
-                Node* node = root.get();
-                while (node->is_fully_expanded()) node = node->select_child(this->c_puct_);
-                auto [end_value, is_terminal] = node->game_state_->get_game_ended();
-                if (is_terminal) {
-                    node->backpropagate(end_value * node->game_state_->get_current_player());
-                    continue;
-                }
-                leaves.push_back(node);
-            }
+                                // MCTS 搜索过程 (与自对弈类似，但使用C++推理引擎)
+                                std::vector<Node*> leaves;
+                                leaves.reserve(num_simulations_);
+                                for (int i = 0; i < num_simulations_; ++i) {
+                                    Node* node = root.get();
+                                    while (node->is_fully_expanded()) node = node->select_child(this->c_puct_);
+                                    auto [end_value, is_terminal] = node->game_state_->get_game_ended();
+                                    if (is_terminal) {
+                                        node->backpropagate(end_value * node->game_state_->get_current_player());
+                                        continue;
+                                    }
+                                    leaves.push_back(node);
+                                }
 
-            if (!leaves.empty()) {
-                std::sort(leaves.begin(), leaves.end());
-                leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
-                std::vector<std::vector<float>> state_batch;
-                state_batch.reserve(leaves.size());
-                for (const auto* leaf : leaves) {
-                    state_batch.push_back(leaf->game_state_->get_state());
-                }
+                                if (!leaves.empty()) {
+                                    std::sort(leaves.begin(), leaves.end());
+                                    leaves.erase(std::unique(leaves.begin(), leaves.end()), leaves.end());
+                                    std::vector<std::vector<float>> state_batch;
+                                    state_batch.reserve(leaves.size());
+                                    for (const auto* leaf : leaves) {
+                                        state_batch.push_back(leaf->game_state_->get_state());
+                                    }
 
-                // 使用当前玩家对应的C++推理引擎
-                auto [policy_batch, value_batch] = current_engine->infer(state_batch, this->board_size_, this->num_channels_);
+                                    // 使用当前玩家对应的C++推理引擎
+                                    auto [policy_batch, value_batch] = current_engine->infer(state_batch, this->board_size_, this->num_channels_);
 
-                for (size_t i = 0; i < leaves.size(); ++i) {
-                        Node* leaf = leaves[i];
-                        const auto& current_policy = policy_batch[i];
+                                    for (size_t i = 0; i < leaves.size(); ++i) {
+                                            Node* leaf = leaves[i];
+                                            const auto& current_policy = policy_batch[i];
 
-                        // 使用新的扩展逻辑，替换旧的 expand 调用
-                        const auto& parent_state = *leaf->game_state_;
-                        const auto valid_moves = parent_state.get_valid_moves();
-                        leaf->children_.reserve(valid_moves.size());
-                        for (size_t action = 0; action < current_policy.size(); ++action) {
-                            if (current_policy[action] > 0.0f && valid_moves[action]) {
-                                auto next_game_state = std::make_shared<Gomoku>(parent_state);
-                                next_game_state->execute_move(action);
-                                leaf->children_.push_back(std::make_unique<Node>(
-                                    next_game_state, leaf, action, current_policy[action]
-                                ));
+                                            // 使用新的扩展逻辑，替换旧的 expand 调用
+                                            const auto& parent_state = *leaf->game_state_;
+                                            const auto valid_moves = parent_state.get_valid_moves();
+                                            leaf->children_.reserve(valid_moves.size());
+                                            for (size_t action = 0; action < current_policy.size(); ++action) {
+                                                if (current_policy[action] > 0.0f && valid_moves[action]) {
+                                                    auto next_game_state = std::make_shared<Gomoku>(parent_state);
+                                                    next_game_state->execute_move(action);
+                                                    leaf->children_.push_back(std::make_unique<Node>(
+                                                        next_game_state, leaf, action, current_policy[action]
+                                                    ));
+                                                }
+                                            }
+                                            leaf->backpropagate(static_cast<double>(value_batch[i]));
+                                        }
+                                }
+
+                                // in EvaluationManager::worker_func
+
+                                // --- 修改开始: 选择动作（随机化平局处理和回退逻辑）---
+                                int action = -1;
+                                if (!root->children_.empty()) {
+                                    int max_visits = -1;
+                                    for (const auto& child : root->children_) {
+                                        if (child && child->visit_count_ > max_visits) {
+                                            max_visits = child->visit_count_;
+                                        }
+                                    }
+
+                                    std::vector<int> best_actions;
+                                    for (const auto& child : root->children_) {
+                                        if (child && child->visit_count_ == max_visits) {
+                                            best_actions.push_back(child->action_taken_);
+                                        }
+                                    }
+
+                                    if (!best_actions.empty()) {
+                                        // 从所有最佳动作中随机选择一个
+                                        static thread_local std::mt19937 generator(std::random_device{}());
+                                        std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
+                                        action = best_actions[dist(generator)];
+                                    }
+                                }
+
+                                // 如果MCTS后仍然没有选出动作（例如根节点无法扩展），则随机选择一个合法的
+                                if (action == -1) {
+                                    auto valid_moves = game.get_valid_moves();
+                                    std::vector<int> valid_move_indices;
+                                    for (size_t i = 0; i < valid_moves.size(); ++i) {
+                                        if (valid_moves[i]) {
+                                            valid_move_indices.push_back(i);
+                                        }
+                                    }
+                                    if (!valid_move_indices.empty()) {
+                                        static thread_local std::mt19937 generator(std::random_device{}());
+                                        std::uniform_int_distribution<size_t> distrib(0, valid_move_indices.size() - 1);
+                                        action = valid_move_indices[distrib(generator)];
+                                    }
+                                }
+                                // --- 修改结束 ---
+
+
+                                if (action == -1) break; // No moves possible, end as draw
+
+                                game.execute_move(action);
+
+                                // 游戏结束判断
+                                auto [final_value, is_done] = game.get_game_ended();
+                                if (is_done) {
+                                    int winner_code = 0; // 默认为平局
+                                    if (std::abs(final_value) > 0.01) { // 判断是否真的分出了胜负
+                                        int winner_result = static_cast<int>(final_value); // 1 代表P1胜, -1 代表P2胜
+
+                                        // 关键：我们要记录的是 model1 和 model2 的胜负
+                                        // winner_code = 1 代表 model1 胜, -1 代表 model2 胜
+                                        if (winner_result == 1) { // 如果 P1 胜了
+                                            // 检查P1是哪个模型
+                                            winner_code = (&p1_engine == &engine1_) ? 1 : -1;
+                                        } else { // 如果 P2 胜了
+                                            // 检查P2是哪个模型
+                                            winner_code = (&p2_engine == &engine1_) ? 1 : -1;
+                                        }
+                                    }
+
+                                                // 使用线程锁，安全地更新总计分板
+                                                {
+                                                    std::lock_guard<std::mutex> lock(results_mutex_);
+                                                    scores_[winner_code]++;
+                                                }
+
+                                                break; // 退出当前这局游戏的循环
+                                                // ======================================================
+                                }
                             }
-                        }
-                        leaf->backpropagate(static_cast<double>(value_batch[i]));
-                    }
-            }
-
-            // in EvaluationManager::worker_func
-
-            // --- 修改开始: 选择动作（随机化平局处理和回退逻辑）---
-            int action = -1;
-            if (!root->children_.empty()) {
-                int max_visits = -1;
-                for (const auto& child : root->children_) {
-                    if (child && child->visit_count_ > max_visits) {
-                        max_visits = child->visit_count_;
-                    }
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lock(g_io_mutex);
+                    std::cerr << "[C++ Eval Worker " << worker_id << ", Game " << game_idx
+                              << "] Exception: " << e.what() << std::endl;
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(g_io_mutex);
+                    std::cerr << "[C++ Eval Worker " << worker_id << ", Game " << game_idx
+                              << "] Unknown exception occurred!" << std::endl;
                 }
 
-                std::vector<int> best_actions;
-                for (const auto& child : root->children_) {
-                    if (child && child->visit_count_ == max_visits) {
-                        best_actions.push_back(child->action_taken_);
-                    }
-                }
 
-                if (!best_actions.empty()) {
-                    // 从所有最佳动作中随机选择一个
-                    static thread_local std::mt19937 generator(std::random_device{}());
-                    std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
-                    action = best_actions[dist(generator)];
-                }
-            }
-
-            // 如果MCTS后仍然没有选出动作（例如根节点无法扩展），则随机选择一个合法的
-            if (action == -1) {
-                auto valid_moves = game.get_valid_moves();
-                std::vector<int> valid_move_indices;
-                for (size_t i = 0; i < valid_moves.size(); ++i) {
-                    if (valid_moves[i]) {
-                        valid_move_indices.push_back(i);
-                    }
-                }
-                if (!valid_move_indices.empty()) {
-                    static thread_local std::mt19937 generator(std::random_device{}());
-                    std::uniform_int_distribution<size_t> distrib(0, valid_move_indices.size() - 1);
-                    action = valid_move_indices[distrib(generator)];
-                }
-            }
-            // --- 修改结束 ---
-
-
-            if (action == -1) break; // No moves possible, end as draw
-
-            game.execute_move(action);
-
-            // 游戏结束判断
-            auto [final_value, is_done] = game.get_game_ended();
-            if (is_done) {
-                int winner_code = 0; // 默认为平局
-                if (std::abs(final_value) > 0.01) { // 判断是否真的分出了胜负
-                    int winner_result = static_cast<int>(final_value); // 1 代表P1胜, -1 代表P2胜
-
-                    // 关键：我们要记录的是 model1 和 model2 的胜负
-                    // winner_code = 1 代表 model1 胜, -1 代表 model2 胜
-                    if (winner_result == 1) { // 如果 P1 胜了
-                        // 检查P1是哪个模型
-                        winner_code = (&p1_engine == &engine1_) ? 1 : -1;
-                    } else { // 如果 P2 胜了
-                        // 检查P2是哪个模型
-                        winner_code = (&p2_engine == &engine1_) ? 1 : -1;
-                    }
-                }
-
-                            // 使用线程锁，安全地更新总计分板
-                            {
-                                std::lock_guard<std::mutex> lock(results_mutex_);
-                                scores_[winner_code]++;
-                            }
-
-                            break; // 退出当前这局游戏的循环
-                            // ======================================================
-            }
-        }
     }
 }
 
