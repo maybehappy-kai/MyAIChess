@@ -13,6 +13,7 @@ Node::Node(std::shared_ptr<const Gomoku> game_state, Node* parent, int action_ta
       prior_(prior),
       visit_count_(0),
       value_sum_(0.0),
+      virtual_loss_count_(0),
       game_state_(std::move(game_state)) {} // <-- 现在这里移动的是一个轻量的指针
 
 Node::~Node() {
@@ -50,24 +51,32 @@ Node* Node::select_child(float c_puct) const {
     return best_child;
 }
 
-// 这是修正后的代码
+// 在文件 cpp_src/Node.cpp 中，找到并替换整个 get_ucb 函数
+
 double Node::get_ucb(const Node* child, float c_puct) const {
-    // UCB公式: Q(s,a) + U(s,a)
-    // Q(s,a) 是动作的价值，U(s,a) 是探索项
+    // vvvvvv 【核心修改】 vvvvvv
+    // UCB公式现在需要同时考虑真实访问和虚拟损失
 
-    // 1. 计算探索项 U(s,a)
-    // N(s) 是父节点的访问次数, N(s,a) 是子节点的访问次数
-    const double u_value = c_puct * child->prior_ * std::sqrt(static_cast<double>(this->visit_count_)) / (1 + child->visit_count_);
+    // 探索项 U(s,a)
+    // 分子中的父节点总“等效”访问次数 N(s)
+    double parent_total_visits = static_cast<double>(this->visit_count_ + this->virtual_loss_count_);
+    // 分母中的子节点总“等效”访问次数 N(s,a)
+    double child_total_visits = static_cast<double>(child->visit_count_ + child->virtual_loss_count_);
 
-    // 2. 计算价值项 Q(s,a)
-    // 如果子节点从未被访问过，其经验平均价值为0
-    // 如果被访问过，Q值是从子节点的角度看的平均价值，对于父节点来说需要取负
+    const double u_value = c_puct * child->prior_ * std::sqrt(parent_total_visits) / (1 + child_total_visits);
+
+    // 价值项 Q(s,a)
+    // 将每次虚拟访问视为一次值为-1的“损失”，这是虚拟损失的标准实现方法
     double q_value = 0.0;
-    if (child->visit_count_ > 0) {
-        q_value = -child->value_sum_ / child->visit_count_;
+    if (child_total_visits > 0) {
+        // Q = (真实的价值总和 - 虚拟损失次数) / (真实访问次数 + 虚拟损失次数)
+        // 注意：value_sum 已经是对手视角的，所以对于父节点是 -value_sum
+         q_value = (child->value_sum_ - child->virtual_loss_count_) / child_total_visits;
     }
 
-    return q_value + u_value;
+    // 对于父节点来说，子节点的Q值需要取反
+    return -q_value + u_value;
+    // ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 }
 
 // file: cpp_src/Node.cpp
@@ -104,16 +113,16 @@ double Node::get_ucb(const Node* child, float c_puct) const {
 //}
 // ===================== 修改结束 =====================
 
-// file: cpp_src/Node.cpp, inside the backpropagate function
+// 在文件 cpp_src/Node.cpp 中，找到 backpropagate 函数并修改
 
 void Node::backpropagate(double value) {
+    // vvvvvv 【核心修改】 vvvvvv
+    // 在反向传播时，一个“虚拟损失”被一次“真实访问”所替代
+    this->virtual_loss_count_--; // 偿还（撤销）一次虚拟损失
+    // ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+    this->visit_count_++; // 增加一次真实访问
     this->value_sum_ += value;
-
-    // vvv 旧的、错误的代码 vvv
-    // this.visit_count_++;
-
-    // vvv 新的、正确的代码 vvv
-    this->visit_count_++; // 将 . 修改为 ->
 
     if (parent_ != nullptr) {
         parent_->backpropagate(-value);

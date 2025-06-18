@@ -25,7 +25,7 @@ args = {
     'num_eval_games': 20,
     'board_size': 9,
     'num_rounds': 25, # 每局游戏的回合数，总步数为 num_rounds * 2
-    'mcts_batch_size': 24,
+    'mcts_batch_size': 32,
 
     # =======================================================
     # --- 请确保您的配置包含以下所有参数 ---
@@ -45,5 +45,5 @@ args = {
     'enable_territory_heuristic': True,  # [之前缺失] True 表示启用领地启发
     'territory_heuristic_weight': 0.3,  # 领地启发所占的权重
     # =======================================================
-    'history_steps': 3, # 记录T-1, T-2, T-3三步历史
+    'history_steps': 4, # 记录T-1, T-2, T-3三步历史
 }

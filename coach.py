@@ -114,34 +114,40 @@ def save_model(model, epoch, args):
         print(f"【错误】导出TorchScript模型失败: {e}")
 
 
+# 在 coach.py 中，用下面的新函数替换旧的 find_latest_model_file 函数
+
 def find_latest_model_file():
     """
-    查找最新的模型文件，并解析其轮次数和结构信息。
+    查找最新的模型文件，当轮次（epoch）相同时，选择最近被修改的文件。
     """
     path = "."
     max_epoch = -1
     latest_file_info = None
-    # vvvvvv 使用新的正则表达式以匹配包含通道数的文件名 vvvvvv
+    latest_mtime = -1  # 用于记录最新文件的修改时间
+
+    # vvvvvv 正则表达式现在只匹配 .pth 文件 vvvvvv
     pattern = re.compile(r"model_(\d+)_(\d+)x(\d+)_(\d+)c\.pth")
-    # ^^^^^^ 使用新的正则表达式以匹配包含通道数的文件名 ^^^^^^
+    # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
     for f in os.listdir(path):
         match = pattern.match(f)
         if match:
             epoch = int(match.group(1))
-            if epoch > max_epoch:
+            full_path = os.path.join(path, f)
+            mtime = os.path.getmtime(full_path)
+
+            # 如果轮次更大，或者轮次相同但文件是更新的，则更新为最新模型
+            if epoch > max_epoch or (epoch == max_epoch and mtime > latest_mtime):
                 max_epoch = epoch
+                latest_mtime = mtime
                 latest_file_info = {
                     'path': f,
                     'epoch': epoch,
                     'res_blocks': int(match.group(2)),
                     'hidden_units': int(match.group(3)),
-                    # vvvvvv 解析并存储文件名中的通道数 vvvvvv
                     'channels': int(match.group(4))
-                    # ^^^^^^ 解析并存储文件名中的通道数 ^^^^^^
                 }
     return latest_file_info
-
 
 # ====================== Coach 类 (已更新 learn 方法) ======================
 
@@ -462,10 +468,15 @@ if __name__ == '__main__':
             try:
                 current_model = transfer_weights(current_model, latest_model_info['path'])
 
-                # 触发现有模型的保存，以生成匹配当前结构的 .pt 文件
-                # 这一步对于C++引擎在下一轮正确加载模型至关重要
                 print("为迁移学习后的新模型创建匹配的 .pt 文件...")
                 save_model(current_model, latest_model_info['epoch'], args)
+
+                # vvvvvvvv 【请务必确认增加了此段代码】 vvvvvvvv
+                # 在保存了迁移后的新模型后，必须立即重新查找并更新评估基准，
+                # 以确保 model_info_before_training 指向的是这个新架构的模型。
+                print("...更新评估基准为新架构的模型...")
+                model_info_before_training = find_latest_model_file()
+                # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
             except Exception as e:
                 print(f"迁移学习失败: {e}，将从随机权重开始训练新结构模型。")

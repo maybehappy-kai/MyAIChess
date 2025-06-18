@@ -274,12 +274,20 @@ void SelfPlayManager::worker_func(int worker_id) {
                     for (int j = 0; j < batch_size && i + j < num_simulations; ++j) {
                         Node* node = root.get();
 
+                        node->virtual_loss_count_++;
+
                         while (node->is_fully_expanded()) {
                             node = node->select_child(this->c_puct_);
+                            node->virtual_loss_count_++;
                         }
 
                         auto [end_value, is_terminal] = node->game_state_->get_game_ended();
                         if (is_terminal) {
+                            Node* temp_node = node;
+                            while(temp_node != nullptr) {
+                                temp_node->virtual_loss_count_--;
+                                temp_node = temp_node->parent_;
+                            }
                             double value_to_propagate = end_value * node->game_state_->get_current_player();
                             node->backpropagate(value_to_propagate);
                         } else {
@@ -628,9 +636,18 @@ void EvaluationManager::worker_func(int worker_id) {
                                 leaves.reserve(num_simulations_);
                                 for (int i = 0; i < num_simulations_; ++i) {
                                     Node* node = root.get();
-                                    while (node->is_fully_expanded()) node = node->select_child(this->c_puct_);
+                                    node->virtual_loss_count_++;
+                                    while (node->is_fully_expanded()) {
+                                        node = node->select_child(this->c_puct_);
+                                        node->virtual_loss_count_++;
+                                    }
                                     auto [end_value, is_terminal] = node->game_state_->get_game_ended();
                                     if (is_terminal) {
+                                        Node* temp_node = node;
+                                                while(temp_node != nullptr) {
+                                                    temp_node->virtual_loss_count_--;
+                                                    temp_node = temp_node->parent_;
+                                                }
                                         node->backpropagate(end_value * node->game_state_->get_current_player());
                                         continue;
                                     }
@@ -821,11 +838,18 @@ int find_best_action_for_state(
     leaves_batch.reserve(num_simulations);
     for (int i = 0; i < num_simulations; ++i) {
         Node* node = root.get();
+        node->virtual_loss_count_++;
         while (node->is_fully_expanded()) {
             node = node->select_child(c_puct);
+            node->virtual_loss_count_++;
         }
         auto [end_value, is_terminal] = node->game_state_->get_game_ended();
         if (is_terminal) {
+            Node* temp_node = node;
+                while(temp_node != nullptr) {
+                    temp_node->virtual_loss_count_--;
+                    temp_node = temp_node->parent_;
+                }
             node->backpropagate(end_value * node->game_state_->get_current_player());
             continue;
         }

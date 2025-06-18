@@ -6,6 +6,7 @@
 #include <memory>   // for std::unique_ptr and std::shared_ptr  <-- 注意这里
 #include <limits>   // for std::numeric_limits
 #include <cmath>    // for std::sqrt
+#include <atomic>
 
 class Node {
 public:
@@ -36,6 +37,8 @@ public: // 成员变量设为公有，方便C++ MCTS引擎直接访问，与Pyth
 
     int visit_count_;
     double value_sum_;
+
+    std::atomic<int> virtual_loss_count_;
 
     // 使用智能指针管理子节点生命周期，父节点拥有子节点
     std::vector<std::unique_ptr<Node>> children_;
