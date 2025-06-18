@@ -55,6 +55,8 @@ private:
             double temperature_end_;
             int temperature_decay_moves_;
 
+            double c_puct_;
+
         // =======================================================
             // --- 核心改动：用C++原生类型替换py::dict args_ ---
             bool   enable_opening_bias_;
@@ -99,6 +101,8 @@ private:
     int board_size_;
         int num_rounds_;
         int num_channels_;
+
+        double c_puct_;
 
     // 用于存储结果的线程安全成员
     std::mutex results_mutex_;

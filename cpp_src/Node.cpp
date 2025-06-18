@@ -31,17 +31,17 @@ bool Node::is_fully_expanded() const {
 }
 
 // 选择UCB值最高的子节点
-Node* Node::select_child() const {
+Node* Node::select_child(float c_puct) const {
     if (children_.empty()) {
         // 这是一个安全检查，理论上不应该被触发
         throw std::runtime_error("Select called on a node with no children.");
     }
 
     Node* best_child = children_[0].get();
-    double best_ucb = get_ucb(best_child);
+    double best_ucb = get_ucb(best_child, c_puct);
 
     for (size_t i = 1; i < children_.size(); ++i) {
-        const double ucb = get_ucb(children_[i].get());
+        const double ucb = get_ucb(children_[i].get(), c_puct);
         if (ucb > best_ucb) {
             best_ucb = ucb;
             best_child = children_[i].get();
@@ -51,13 +51,13 @@ Node* Node::select_child() const {
 }
 
 // 这是修正后的代码
-double Node::get_ucb(const Node* child) const {
+double Node::get_ucb(const Node* child, float c_puct) const {
     // UCB公式: Q(s,a) + U(s,a)
     // Q(s,a) 是动作的价值，U(s,a) 是探索项
 
     // 1. 计算探索项 U(s,a)
     // N(s) 是父节点的访问次数, N(s,a) 是子节点的访问次数
-    const double u_value = C_PUCT * child->prior_ * std::sqrt(static_cast<double>(this->visit_count_)) / (1 + child->visit_count_);
+    const double u_value = c_puct * child->prior_ * std::sqrt(static_cast<double>(this->visit_count_)) / (1 + child->visit_count_);
 
     // 2. 计算价值项 Q(s,a)
     // 如果子节点从未被访问过，其经验平均价值为0
@@ -81,7 +81,7 @@ double Node::get_ucb(const Node* child) const {
 // file: cpp_src/Node.cpp
 
 // ===================== 这是最终的、绝对正确的解决方案 =====================
-void Node::expand(const std::vector<float>& policy) {
+//void Node::expand(const std::vector<float>& policy) {
     /*const auto valid_moves = game_state_.get_valid_moves();
     children_.reserve(policy.size());
 
@@ -101,7 +101,7 @@ void Node::expand(const std::vector<float>& policy) {
             children_.push_back(std::make_unique<Node>(next_game_state, this, action, policy[action]));
         }
     }*/
-}
+//}
 // ===================== 修改结束 =====================
 
 // file: cpp_src/Node.cpp, inside the backpropagate function

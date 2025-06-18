@@ -19,15 +19,15 @@ public:
     // ^^^ 修改结束 ^^^
 
     // 核心MCTS方法
-    Node* select_child() const;
-    void expand(const std::vector<float>& policy);
+    Node* select_child(float c_puct) const;
+    // void expand(const std::vector<float>& policy);
     void backpropagate(double value);
 
     // 检查节点是否已经扩展过（即是否拥有子节点）
     bool is_fully_expanded() const;
 
     // 计算给定子节点的UCB值
-    double get_ucb(const Node* child) const;
+    double get_ucb(const Node* child, float c_puct) const;
 
 public: // 成员变量设为公有，方便C++ MCTS引擎直接访问，与Python版本保持一致
     Node* parent_;

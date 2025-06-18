@@ -137,7 +137,10 @@ class GameGUI:
             self.font_medium = pygame.font.Font(None, 32);
             self.font_small = pygame.font.Font(None, 22)
         self.clock = pygame.time.Clock()
-        self.game = PythonGomoku()
+        self.game = PythonGomoku(
+            board_size=args['board_size'],
+            num_rounds=args['num_rounds']
+        )
         self.particles = []
         self.human_player = 1
         self.model_file = find_latest_model_file()

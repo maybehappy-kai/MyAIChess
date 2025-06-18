@@ -343,7 +343,7 @@ class Coach:
 
         base_eval_args = {
             'num_eval_games': games_per_side,
-            'num_eval_simulations': self.args.get('num_eval_simulations', 20),
+            'num_eval_simulations': self.args['num_searches'],
             'num_cpu_threads': self.args.get('num_cpu_threads', 18)
         }
 

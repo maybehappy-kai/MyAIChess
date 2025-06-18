@@ -175,6 +175,7 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
                     this->num_rounds_ = args.contains("num_rounds") ? args["num_rounds"].cast<int>() : 25;
                     this->history_steps_ = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
                     this->num_channels_ = args["num_channels"].cast<int>();
+                    this->c_puct_ = args["C"].cast<double>();
 }
 // ===============================================================
 
@@ -274,7 +275,7 @@ void SelfPlayManager::worker_func(int worker_id) {
                         Node* node = root.get();
 
                         while (node->is_fully_expanded()) {
-                            node = node->select_child();
+                            node = node->select_child(this->c_puct_);
                         }
 
                         auto [end_value, is_terminal] = node->game_state_->get_game_ended();
@@ -542,6 +543,7 @@ EvaluationManager::EvaluationManager(std::shared_ptr<InferenceEngine> engine1, s
     this->board_size_ = args.contains("board_size") ? args["board_size"].cast<int>() : 9;
         this->num_rounds_ = args.contains("num_rounds") ? args["num_rounds"].cast<int>() : 25;
         this->num_channels_ = (args["history_steps"].cast<int>() + 1) * 4 + 4;
+        this->c_puct_ = args["C"].cast<double>();
     scores_[1] = 0;
     scores_[-1] = 0;
     scores_[0] = 0;
@@ -612,7 +614,7 @@ void EvaluationManager::worker_func(int worker_id) {
             leaves.reserve(num_simulations_);
             for (int i = 0; i < num_simulations_; ++i) {
                 Node* node = root.get();
-                while (node->is_fully_expanded()) node = node->select_child();
+                while (node->is_fully_expanded()) node = node->select_child(this->c_puct_);
                 auto [end_value, is_terminal] = node->game_state_->get_game_ended();
                 if (is_terminal) {
                     node->backpropagate(end_value * node->game_state_->get_current_player());
@@ -749,6 +751,8 @@ int find_best_action_for_state(
 
     auto engine = get_cached_engine(model_path, use_gpu);
 
+    double c_puct = args["C"].cast<double>();
+
     int board_size = args["board_size"].cast<int>();
     int max_total_moves = args.contains("max_total_moves") ? args["max_total_moves"].cast<int>() : 50;
     int history_steps = args.contains("history_steps") ? args["history_steps"].cast<int>() : 0;
@@ -793,7 +797,7 @@ int find_best_action_for_state(
     for (int i = 0; i < num_simulations; ++i) {
         Node* node = root.get();
         while (node->is_fully_expanded()) {
-            node = node->select_child();
+            node = node->select_child(c_puct);
         }
         auto [end_value, is_terminal] = node->game_state_->get_game_ended();
         if (is_terminal) {
