@@ -353,6 +353,7 @@ class Coach:
             'num_eval_simulations': self.args['num_searches'],  # 使用 num_searches 的值
             'num_cpu_threads': self.args.get('num_cpu_threads', 18),
             'C': self.args['C'],
+            'mcts_batch_size': self.args['mcts_batch_size'],  # <-- 新增这一行
 
             # C++引擎初始化Gomoku和模型所需的通用参数
             'board_size': self.args['board_size'],

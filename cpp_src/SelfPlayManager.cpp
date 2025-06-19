@@ -387,11 +387,11 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
             }
 
             // 注意：反向传播时，要偿还之前加上的虚拟损失
-            Node *temp_node = leaf;
+            /*Node *temp_node = leaf;
             while (temp_node != nullptr) {
                 temp_node->virtual_loss_count_--;
                 temp_node = temp_node->parent_;
-            }
+            }*/
             leaf->backpropagate(final_value);
         }
     } // ================== MCTS 主循环结束 ==================
@@ -538,18 +538,20 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
     this->mcts_config_.temperature_end = args["temperature_end"].cast<double>();
     this->mcts_config_.temperature_decay_moves = args["temperature_decay_moves"].cast<int>();
 }
-// ==================== 新增：搬运工线程的完整实现 ====================
+// file: cpp_src/SelfPlayManager.cpp
+// 找到 SelfPlayManager::collector_func 函数，并用下面的完整版本替换它
+
 void SelfPlayManager::collector_func()
 {
+    // 主循环：在游戏还在进行时，持续搬运数据
     while (completed_games_count_ < num_total_games_)
     {
         TrainingDataPacket packet;
         if (data_collector_queue_.try_pop(packet))
         {
             // 成功从中转站取出数据包
-            // 现在，只有这个线程需要获取GIL来与Python交互
+            // 这部分逻辑保持不变
             py::gil_scoped_acquire acquire;
-
             py::list training_examples_list;
             for (const auto &ex : packet)
             {
@@ -569,6 +571,29 @@ void SelfPlayManager::collector_func()
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
+
+    // ====================== 【新增的收尾工作】 ======================
+    // 主循环退出后（所有游戏都已完成），为防止有数据在竞态中被遗漏，
+    // 我们需要在这里彻底清空一次队列。
+    TrainingDataPacket packet;
+    while (data_collector_queue_.try_pop(packet))
+    {
+        // 这里的逻辑和主循环中完全一样，确保最后的数据也被处理
+        py::gil_scoped_acquire acquire;
+        py::list training_examples_list;
+        for (const auto &ex : packet)
+        {
+            training_examples_list.append(py::make_tuple(
+                py::cast(std::get<0>(ex)),
+                py::cast(std::get<1>(ex)),
+                py::cast(std::get<2>(ex))));
+        }
+        py::dict data_to_send;
+        data_to_send["type"] = "data";
+        data_to_send["data"] = training_examples_list;
+        final_data_queue_.attr("put")(data_to_send);
+    }
+    // ==============================================================
 }
 
 void SelfPlayManager::run()
@@ -755,6 +780,10 @@ EvaluationManager::EvaluationManager(
     this->mcts_config_.temperature_start = 0.0;
     this->mcts_config_.temperature_end = 0.0;
     this->mcts_config_.temperature_decay_moves = 0;
+
+    this->scores_[1] = 0;   // 为"模型1胜利"初始化
+    this->scores_[-1] = 0;  // 为"模型2胜利"初始化
+    this->scores_[0] = 0;   // 为"平局"初始化
 }
 
 py::dict EvaluationManager::get_results() const
