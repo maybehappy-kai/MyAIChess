@@ -49,11 +49,12 @@ public:
     void execute_move(int action);
     std::vector<bool> get_valid_moves() const;
     std::pair<double, bool> get_game_ended() const;
-    std::vector<float> get_state() const;
+    std::vector<float> get_state(const std::deque<BitboardState>& history) const;
     int get_current_player() const;
     int get_board_size() const;
     int get_move_number() const;
     int get_territory_score() const;
+    BitboardState get_bitboard_state() const;
 
     // 调试与辅助函数
     void print_board() const;
@@ -80,5 +81,5 @@ private:
     uint64_t white_territory_[2];
 
     // 历史状态队列
-    std::deque<BitboardState> history_;
+    //std::deque<BitboardState> history_;
 };

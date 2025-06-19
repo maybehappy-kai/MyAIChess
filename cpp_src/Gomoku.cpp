@@ -47,7 +47,7 @@ Gomoku::Gomoku(
         this->black_territory_[i] = black_t[i];
         this->white_territory_[i] = white_t[i];
     }
-    history_.clear();
+    //history_.clear();
     BitboardState current_state;
     for (int i = 0; i < 2; ++i) {
         current_state.black_stones[i] = this->black_stones_[i];
@@ -55,9 +55,9 @@ Gomoku::Gomoku(
         current_state.black_territory[i] = this->black_territory_[i];
         current_state.white_territory[i] = this->white_territory_[i];
     }
-    for (int i = 0; i < history_steps_ + 1; ++i) {
+    /*for (int i = 0; i < history_steps_ + 1; ++i) {
         history_.push_back(current_state);
-    }
+    }*/
 }
 
 Gomoku::Gomoku(const Gomoku& other)
@@ -73,7 +73,7 @@ Gomoku::Gomoku(const Gomoku& other)
         this->black_territory_[i] = other.black_territory_[i];
         this->white_territory_[i] = other.white_territory_[i];
     }
-    this->history_ = other.history_;
+    //this->history_ = other.history_;
 }
 
 Gomoku& Gomoku::operator=(const Gomoku& other) {
@@ -88,7 +88,7 @@ Gomoku& Gomoku::operator=(const Gomoku& other) {
             this->black_territory_[i] = other.black_territory_[i];
             this->white_territory_[i] = other.white_territory_[i];
         }
-        this->history_ = other.history_;
+        //this->history_ = other.history_;
     }
     return *this;
 }
@@ -105,11 +105,11 @@ void Gomoku::reset() {
     current_player_ = PLAYER_BLACK;
     current_move_number_ = 0;
     last_move_action_ = -1;
-    history_.clear();
+    //history_.clear();
     BitboardState empty_state = { {0,0}, {0,0}, {0,0}, {0,0} };
-    for (int i = 0; i < history_steps_ + 1; ++i) {
+    /*for (int i = 0; i < history_steps_ + 1; ++i) {
         history_.push_front(empty_state);
-    }
+    }*/
 }
 
 void Gomoku::execute_move(int action) {
@@ -119,7 +119,7 @@ void Gomoku::execute_move(int action) {
         throw std::invalid_argument("Invalid move action.");
     }
 
-    BitboardState current_state_for_history;
+    /*BitboardState current_state_for_history;
     for (int i = 0; i < 2; ++i) {
         current_state_for_history.black_stones[i] = this->black_stones_[i];
         current_state_for_history.white_stones[i] = this->white_stones_[i];
@@ -129,7 +129,7 @@ void Gomoku::execute_move(int action) {
     history_.push_front(current_state_for_history);
     if (history_.size() > static_cast<size_t>(history_steps_ + 1)) {
         history_.pop_back();
-    }
+    }*/
 
     const int pos = r * board_size_ + c;
     const int index = pos / 64;
@@ -229,7 +229,78 @@ std::pair<double, bool> Gomoku::get_game_ended() const {
     return {0.0, false};
 }
 
-std::vector<float> Gomoku::get_state() const {
+std::vector<float> Gomoku::get_state(const std::deque<BitboardState>& history) const {
+    const int plane_size = board_size_ * board_size_;
+    const int total_channels = (history_steps_ + 1) * 4 + 4;
+    std::vector<float> state(total_channels * plane_size, 0.0f);
+
+    for (int t = 0; t <= history_steps_; ++t) {
+        if (static_cast<size_t>(t) >= history.size()) continue;
+
+        // 注意：这里player_at_t的计算逻辑可能需要根据调用者如何构建history进行调整
+        // 假设调用者提供的history[0]是当前状态的前一步(T-1)，history[1]是T-2...
+        // 那么history[t]对应的玩家是 current_player_ * (-1)^(t+1)
+        const int player_at_t = (t % 2 == 0) ? -current_player_ : current_player_;
+
+        const BitboardState& historical_state = history[t];
+        const uint64_t* p1_s = (player_at_t == PLAYER_BLACK) ? historical_state.black_stones : historical_state.white_stones;
+        const uint64_t* p2_s = (player_at_t == PLAYER_BLACK) ? historical_state.white_stones : historical_state.black_stones;
+        const uint64_t* p1_t = (player_at_t == PLAYER_BLACK) ? historical_state.black_territory : historical_state.white_territory;
+        const uint64_t* p2_t = (player_at_t == PLAYER_BLACK) ? historical_state.white_territory : historical_state.black_territory;
+        const int channel_offset = (t + 1) * 4; // T-1, T-2...从第4个通道开始
+        for (int i = 0; i < plane_size; ++i) {
+            const int index = i / 64;
+            const uint64_t mask = 1ULL << (i % 64);
+            if (p1_s[index] & mask) state[(channel_offset + 0) * plane_size + i] = 1.0f;
+            if (p2_s[index] & mask) state[(channel_offset + 1) * plane_size + i] = 1.0f;
+            if (p1_t[index] & mask) state[(channel_offset + 2) * plane_size + i] = 1.0f;
+            if (p2_t[index] & mask) state[(channel_offset + 3) * plane_size + i] = 1.0f;
+        }
+    }
+
+    // 填充当前状态 (T=0)
+    const uint64_t* current_p1_s = (current_player_ == PLAYER_BLACK) ? black_stones_ : white_stones_;
+    const uint64_t* current_p2_s = (current_player_ == PLAYER_BLACK) ? white_stones_ : black_stones_;
+    const uint64_t* current_p1_t = (current_player_ == PLAYER_BLACK) ? black_territory_ : white_territory_;
+    const uint64_t* current_p2_t = (current_player_ == PLAYER_BLACK) ? white_territory_ : black_territory_;
+    for (int i = 0; i < plane_size; ++i) {
+        const int index = i / 64;
+        const uint64_t mask = 1ULL << (i % 64);
+        if (current_p1_s[index] & mask) state[0 * plane_size + i] = 1.0f;
+        if (current_p2_s[index] & mask) state[1 * plane_size + i] = 1.0f;
+        if (current_p1_t[index] & mask) state[2 * plane_size + i] = 1.0f;
+        if (current_p2_t[index] & mask) state[3 * plane_size + i] = 1.0f;
+    }
+
+    // 填充元数据通道
+    const int meta_offset = (history_steps_ + 1) * 4;
+    const float player_indicator = (current_player_ == PLAYER_BLACK) ? 1.0f : 0.0f;
+    std::fill(state.begin() + (meta_offset + 0) * plane_size, state.begin() + (meta_offset + 1) * plane_size, player_indicator);
+    const float progress = (max_total_moves_ > 0) ? static_cast<float>(current_move_number_) / max_total_moves_ : 0.0f;
+    std::fill(state.begin() + (meta_offset + 1) * plane_size, state.begin() + (meta_offset + 2) * plane_size, progress);
+    if (last_move_action_ != -1) {
+        state[(meta_offset + 2) * plane_size + last_move_action_] = 1.0f;
+    }
+
+    // 填充“领地变化”通道
+    if (!history.empty()) {
+        const BitboardState& prev_board = history.front(); // T-1步的状态
+        const int last_player = -current_player_;
+        const uint64_t* territory_curr = (last_player == PLAYER_BLACK) ? black_territory_ : white_territory_;
+        const uint64_t* territory_prev = (last_player == PLAYER_BLACK) ? prev_board.black_territory : prev_board.white_territory;
+        uint64_t changed[2] = { territory_curr[0] & ~territory_prev[0], territory_curr[1] & ~territory_prev[1] };
+        for (int i = 0; i < plane_size; ++i) {
+            const int index = i / 64;
+            const uint64_t mask = 1ULL << (i % 64);
+            if (changed[index] & mask) {
+                state[(meta_offset + 3) * plane_size + i] = 1.0f;
+            }
+        }
+    }
+    return state;
+}
+
+/*std::vector<float> Gomoku::get_state() const {
     const int plane_size = board_size_ * board_size_;
     const int total_channels = (history_steps_ + 1) * 4 + 4;
     std::vector<float> state(total_channels * plane_size, 0.0f);
@@ -277,7 +348,7 @@ std::vector<float> Gomoku::get_state() const {
         }
     }
     return state;
-}
+}*/
 
 std::map<int, int> Gomoku::calculate_scores() const {
     std::map<int, int> scores;
@@ -309,6 +380,17 @@ bool Gomoku::is_occupied(int r, int c) const {
 }
 
 // 文件: cpp_src/Gomoku.cpp
+
+BitboardState Gomoku::get_bitboard_state() const {
+    BitboardState current_state;
+    for (int i = 0; i < 2; ++i) {
+        current_state.black_stones[i] = this->black_stones_[i];
+        current_state.white_stones[i] = this->white_stones_[i];
+        current_state.black_territory[i] = this->black_territory_[i];
+        current_state.white_territory[i] = this->white_territory_[i];
+    }
+    return current_state;
+}
 
 // 用下面的新版本替换整个 print_board() 函数
 void Gomoku::print_board() const {
