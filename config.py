@@ -2,8 +2,8 @@
 
 args = {
     'C': 2,
-    'num_searches': 1600,
-    'num_iterations': 9,
+    'num_searches': 800,
+    'num_iterations': 10,
     'num_selfPlay_episodes': 100,
     'num_cpu_threads': 18,
     'num_epochs': 4,
@@ -25,7 +25,7 @@ args = {
     'num_eval_games': 20,
     'board_size': 9,
     'num_rounds': 25, # 每局游戏的回合数，总步数为 num_rounds * 2
-    'mcts_batch_size': 32,
+    'mcts_batch_size': 64,
 
     # =======================================================
     # --- 请确保您的配置包含以下所有参数 ---

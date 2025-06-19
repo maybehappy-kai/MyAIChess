@@ -149,6 +149,7 @@ void Gomoku::process_patterns_and_territory(int r, int c) {
     uint64_t* player_stones = (current_player_ == PLAYER_BLACK) ? black_stones_ : white_stones_;
     uint64_t* opponent_stones = (current_player_ == PLAYER_BLACK) ? white_stones_ : black_stones_;
     uint64_t* player_territory = (current_player_ == PLAYER_BLACK) ? black_territory_ : white_territory_;
+    uint64_t* opponent_territory = (current_player_ == PLAYER_BLACK) ? white_territory_ : black_territory_;
     const std::array<std::array<std::pair<int, int>, 3>, 12> combinations = {{{{{0,-2},{0,-1},{0,0}}},{{{0,-1},{0,0},{0,1}}},{{{0,0},{0,1},{0,2}}},{{{-2,0},{-1,0},{0,0}}},{{{-1,0},{0,0},{1,0}}},{{{0,0},{1,0},{2,0}}},{{{-2,-2},{-1,-1},{0,0}}},{{{-1,-1},{0,0},{1,1}}},{{{0,0},{1,1},{2,2}}},{{{2,-2},{1,-1},{0,0}}},{{{1,-1},{0,0},{-1,1}}},{{{0,0},{-1,1},{-2,2}}}}};
     uint64_t to_remove[2] = {0, 0};
     bool axis_found[4] = {false, false, false, false};
@@ -186,6 +187,7 @@ void Gomoku::process_patterns_and_territory(int r, int c) {
                     int pos = cr * board_size_ + cc, index = pos / 64;
                     uint64_t mask = 1ULL << (pos % 64);
                     if (opponent_stones[index] & mask) break;
+                    opponent_territory[index] &= ~mask;
                     player_territory[index] |= mask;
                     cr += sign * dr; cc += sign * dc;
                 }
@@ -306,17 +308,37 @@ bool Gomoku::is_occupied(int r, int c) const {
     return (black_stones_[index] & mask) || (white_stones_[index] & mask);
 }
 
-// 【最终修正】重写print_board以支持位棋盘
+// 文件: cpp_src/Gomoku.cpp
+
+// 用下面的新版本替换整个 print_board() 函数
 void Gomoku::print_board() const {
-    std::cout << "--- Board (Player: " << (current_player_ == 1 ? "B" : "W") << ", Move: " << current_move_number_ << ") ---" << std::endl;
+    std::cout << "--- Board (Player: " << (current_player_ == 1 ? "B" : "W")
+              << ", Move: " << current_move_number_ << ") ---" << std::endl;
+
+    // 计算当前双方的领地总数并打印
+    int black_score = popcount(black_territory_[0]) + popcount(black_territory_[1]);
+    int white_score = popcount(white_territory_[0]) + popcount(white_territory_[1]);
+    std::cout << "--- Territory Score: Black(x) = " << black_score
+              << ", White(o) = " << white_score << " ---" << std::endl;
+
     for (int r = 0; r < board_size_; ++r) {
         for (int c = 0; c < board_size_; ++c) {
             const int pos = r * board_size_ + c;
             const int index = pos / 64;
             const uint64_t mask = 1ULL << (pos % 64);
-            char piece = '.';
-            if (black_stones_[index] & mask) piece = 'X';
-            else if (white_stones_[index] & mask) piece = 'O';
+
+            char piece = '.'; // 默认为空地
+
+            if (black_stones_[index] & mask) {
+                piece = 'X'; // 大写X代表黑棋
+            } else if (white_stones_[index] & mask) {
+                piece = 'O'; // 大写O代表白棋
+            } else if (black_territory_[index] & mask) {
+                piece = 'x'; // 小写x代表黑方领地
+            } else if (white_territory_[index] & mask) {
+                piece = 'o'; // 小写o代表白方领地
+            }
+
             std::cout << piece << " ";
         }
         std::cout << std::endl;

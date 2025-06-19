@@ -405,7 +405,7 @@ void SelfPlayManager::worker_func(int worker_id)
                         if (leaf->parent_ == nullptr)
                         { // 只对根节点操作
                             // --- 注入开局偏置 ---
-                            if (this->enable_opening_bias_ && leaf_state_for_expansion.get_move_number() == 0)
+                            if (this->enable_opening_bias_ && leaf_state_for_expansion.get_move_number() < 50)
                             {
                                 const int board_size = leaf_state_for_expansion.get_board_size();
                                 float bias_strength = this->opening_bias_strength_;
@@ -793,6 +793,8 @@ void EvaluationManager::worker_func(int worker_id)
 
             };
 
+            int move_counter_for_print = 0; // 添加一个计数器
+
             // ====================== 评估函数单步棋主循环（最终重构版） ======================
             while (true) {
                 int current_player = game.get_current_player(); // 保留行
@@ -930,16 +932,35 @@ void EvaluationManager::worker_func(int worker_id)
 
                 game.execute_move(action); // 保留行
 
-                // 游戏结束判断 (逻辑不变)
+                if (worker_id == 0 && game_idx == 0) { // 只打印0号工人玩的第一局游戏
+                        std::lock_guard<std::mutex> lock(g_io_mutex); // 使用全局锁确保打印不混乱
+                        std::cout << "\n===== Game 0, Worker 0, Move " << move_counter_for_print++ << " =====" << std::endl;
+                        std::cout << "Player " << game.get_current_player() * -1 << " played action " << action << std::endl;
+                        game.print_board();
+                    }
+
+                // file: cpp_src/SelfPlayManager.cpp
+
+                // ...
                 auto [final_value, is_done] = game.get_game_ended();
                 if (is_done) {
-                    int winner_code = 0;
+                    int winner_code = 0; // 0 for draw
                     if (std::abs(final_value) > 0.01) {
-                        int winner_result = static_cast<int>(final_value);
-                        if (winner_result == 1) {
-                            winner_code = (&p1_engine == &engine1_) ? 1 : -1;
+                        int winner_player = static_cast<int>(final_value); // 1 for P1 (black), -1 for P2 (white)
+
+                        // 判断胜利方的引擎是哪一个
+                        std::shared_ptr<InferenceEngine> winning_engine;
+                        if (winner_player == 1) {
+                            winning_engine = p1_engine;
+                        } else { // winner_player == -1
+                            winning_engine = p2_engine;
+                        }
+
+                        // 无论谁赢，都统一检查胜利的引擎是 model1 还是 model2
+                        if (winning_engine == engine1_) {
+                            winner_code = 1; // Model 1 (旧模型) 胜利
                         } else {
-                            winner_code = (&p2_engine == &engine1_) ? 1 : -1;
+                            winner_code = -1; // Model 2 (新模型) 胜利
                         }
                     }
 
