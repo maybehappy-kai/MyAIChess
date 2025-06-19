@@ -11,7 +11,7 @@ args = {
     'learning_rate': 0.001,
     'data_max_size': 200000,
     'num_res_blocks': 9,
-    'num_hidden': 256,
+    'num_hidden': 128,
     'dirichlet_alpha': 0.3,
     'dirichlet_epsilon': 0.25,
     'value_loss_weight': 0.25,
@@ -25,7 +25,7 @@ args = {
     'num_eval_games': 20,
     'board_size': 9,
     'num_rounds': 25, # 每局游戏的回合数，总步数为 num_rounds * 2
-    'mcts_batch_size': 256,
+    'mcts_batch_size': 64,
 
     # =======================================================
     # --- 请确保您的配置包含以下所有参数 ---

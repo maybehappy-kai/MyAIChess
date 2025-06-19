@@ -241,48 +241,48 @@ enum class MCTS_MODE
     EVALUATION // 用于评估或人机对战，确定性的贪婪选择
 };
 
-// 这个函数是新的核心，执行MCTS并返回一个动作
+// file: cpp_src/SelfPlayManager.cpp
+// 请用这个【完整、干净】的函数替换掉你文件中的旧函数
+
 std::pair<int, std::vector<float>> find_best_action_by_mcts(
     const Gomoku &root_state,
     const std::deque<BitboardState> &history,
     InferenceEngine &engine,
-    const MCTS_Config &config, // <-- 使用配置结构体
+    const MCTS_Config &config,
     MCTS_MODE mode)
 {
+    // 竞技场和根节点初始化 (保持不变)
     auto root = std::make_unique<Node>(nullptr, -1, 1.0f);
-    Arena arena(256 * 1024 * 1024); // 为本次搜索创建一个独立的内存竞技场
+    Arena arena(256 * 1024 * 1024);
 
-    const int num_simulations = config.num_simulations;
-    const int mcts_batch_size = config.mcts_batch_size;
-    const double c_puct = config.c_puct;
-    const int history_steps = config.history_steps;
-    const int num_channels = config.num_channels;
-    // === 核心MCTS批处理搜索循环 (从worker_func中完整迁移) ===
-    for (int i = 0; i < num_simulations; i += mcts_batch_size)
+    // ================== MCTS 主循环 (修正循环结构) ==================
+    for (int i = 0; i < config.num_simulations; i += config.mcts_batch_size)
     {
         std::vector<Node *> leaves_batch;
-        leaves_batch.reserve(mcts_batch_size);
+        leaves_batch.reserve(config.mcts_batch_size);
 
-        // 1a. 收集叶子节点
-        for (int j = 0; j < mcts_batch_size && i + j < num_simulations; ++j)
+        // 1a. 收集叶子节点 (选择阶段)
+        for (int j = 0; j < config.mcts_batch_size && i + j < config.num_simulations; ++j)
         {
             Node *node = root.get();
-            node->virtual_loss_count_++;
+            node->virtual_loss_count_++; // 添加虚拟损失
             while (node->is_fully_expanded())
             {
-                node = node->select_child(c_puct);
+                node = node->select_child(config.c_puct);
                 node->virtual_loss_count_++;
             }
 
+            // 检查叶子节点是否是终局状态
             Gomoku current_node_state = reconstruct_game_state(node, root_state);
             auto [end_value, is_terminal] = current_node_state.get_game_ended();
 
             if (is_terminal)
             {
+                // 如果是终局，直接反向传播结果，无需神经网络
                 Node *temp_node = node;
                 while (temp_node != nullptr)
                 {
-                    temp_node->virtual_loss_count_--;
+                    temp_node->virtual_loss_count_--; // 偿还虚拟损失
                     temp_node = temp_node->parent_;
                 }
                 double value_to_propagate = end_value * current_node_state.get_current_player();
@@ -290,6 +290,7 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
             }
             else
             {
+                // 如果不是终局，则加入批处理队列等待扩展
                 leaves_batch.push_back(node);
             }
         }
@@ -297,200 +298,198 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
         if (leaves_batch.empty())
             continue;
 
-        // 1b. 准备输入并进行神经网络推理
+        // 1b. 准备输入并进行神经网络推理 (保持不变)
         std::vector<std::vector<float>> state_batch;
         state_batch.reserve(leaves_batch.size());
         for (const auto *leaf : leaves_batch)
         {
             Gomoku leaf_state = reconstruct_game_state(leaf, root_state);
             std::deque<BitboardState> leaf_history = gather_history_for_leaf(
-                leaf, root_state, history, history_steps);
+                leaf, root_state, history, config.history_steps);
             state_batch.push_back(leaf_state.get_state(leaf_history));
         }
-        auto [policy_batch, value_batch] = engine.infer(state_batch, root_state.get_board_size(), num_channels);
+        auto [policy_batch, value_batch] = engine.infer(state_batch, root_state.get_board_size(), config.num_channels);
 
-        // 1c. 扩展和反向传播
+        // ================== 1c. 扩展和反向传播 (核心修正区域) ==================
         for (size_t k = 0; k < leaves_batch.size(); ++k)
         {
             Node *leaf = leaves_batch[k];
             auto current_policy = policy_batch[k];
             Gomoku leaf_state_for_expansion = reconstruct_game_state(leaf, root_state);
 
-            // 只在自对弈模式下，且是根节点时，才应用噪声和启发式策略
+            // 【修正点 1】: 将特殊逻辑(噪声/启发)与通用逻辑(扩展/回传)分离
+            // 特殊逻辑只对根节点生效
             if (mode == MCTS_MODE::SELF_PLAY && leaf->parent_ == nullptr)
             {
-                // (这里的代码直接从 SelfPlayManager::worker_func 复制而来)
                 if (config.enable_opening_bias && leaf_state_for_expansion.get_move_number() < 50)
                 {
+                    // ... (开局偏置代码保持不变) ...
                     const int board_size = leaf_state_for_expansion.get_board_size();
                     float bias_strength = config.opening_bias_strength;
                     std::vector<float> opening_bias(board_size * board_size, 0.0f);
-                    for (int r = 0; r < board_size; ++r)
-                    {
-                        for (int c = 0; c < board_size; ++c)
-                        {
+                    for (int r = 0; r < board_size; ++r) {
+                        for (int c = 0; c < board_size; ++c) {
                             int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
                             float bias = 0.0f;
-                            if (dist_from_edge == 0)
-                                bias = 0.1f;
-                            else if (dist_from_edge == 1)
-                                bias = 0.4f;
-                            else if (dist_from_edge == 2)
-                                bias = 0.8f;
-                            else
-                                bias = 1.0f;
+                            if (dist_from_edge == 0) bias = 0.1f;
+                            else if (dist_from_edge == 1) bias = 0.4f;
+                            else if (dist_from_edge == 2) bias = 0.8f;
+                            else bias = 1.0f;
                             opening_bias[r * board_size + c] = bias;
                         }
                     }
                     float policy_sum = 0.0f;
-                    for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i)
-                    {
+                    for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i) {
                         current_policy[pol_i] += bias_strength * opening_bias[pol_i];
                         policy_sum += current_policy[pol_i];
                     }
-                    if (policy_sum > 0.0f)
-                    {
-                        for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i)
-                        {
+                    if (policy_sum > 0.0f) {
+                        for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i) {
                             current_policy[pol_i] /= policy_sum;
                         }
                     }
-                    if (config.enable_threat_detection)
-                    {
-                        apply_threat_detection_bias(current_policy, leaf_state_for_expansion, config.threat_detection_bonus);
-                    }
-                    add_dirichlet_noise(current_policy, leaf_state_for_expansion.get_valid_moves(),
-                                        config.dirichlet_alpha, config.dirichlet_epsilon);
                 }
-
-                const auto valid_moves = leaf_state_for_expansion.get_valid_moves();
-                for (size_t action = 0; action < current_policy.size(); ++action)
+                if (config.enable_threat_detection)
                 {
-                    if (current_policy[action] > 0.0f && valid_moves[action])
-                    {
-                        try
-                        {
-                            Node *child_node = new (arena.allocate<Node>()) Node(leaf, action, current_policy[action]);
-                            leaf->children_.push_back(child_node);
-                        }
-                        catch (const std::bad_alloc &)
-                        {
-                            g_arena_full_count++;
-                            break;
-                        }
-                    }
+                    apply_threat_detection_bias(current_policy, leaf_state_for_expansion, config.threat_detection_bonus);
                 }
-
-                double nn_value = static_cast<double>(value_batch[k]);
-                double final_value = nn_value;
-                if (mode == MCTS_MODE::SELF_PLAY && config.enable_territory_heuristic)
-                {
-                    double territory_score = static_cast<double>(leaf_state_for_expansion.get_territory_score());
-
-                    double heuristic_value = territory_score / (root_state.get_board_size() * root_state.get_board_size());
-                    final_value = (1.0 - config.territory_heuristic_weight) * nn_value + config.territory_heuristic_weight * heuristic_value;
-                }
-                leaf->backpropagate(final_value);
+                add_dirichlet_noise(current_policy, leaf_state_for_expansion.get_valid_moves(),
+                                    config.dirichlet_alpha, config.dirichlet_epsilon);
             }
+
+            // 【修正点 2】: 扩展逻辑对所有叶子节点生效
+            const auto valid_moves = leaf_state_for_expansion.get_valid_moves();
+            for (size_t action = 0; action < current_policy.size(); ++action)
+            {
+                if (current_policy[action] > 0.0f && valid_moves[action])
+                {
+                    try
+                    {
+                        Node *child_node = new (arena.allocate<Node>()) Node(leaf, action, current_policy[action]);
+                        leaf->children_.push_back(child_node);
+                    }
+                    catch (const std::bad_alloc &)
+                    {
+                        g_arena_full_count++;
+                        break;
+                    }
+                }
+            }
+
+            // 【修正点 3】: 价值计算与反向传播逻辑对所有叶子节点生效
+            double nn_value = static_cast<double>(value_batch[k]);
+            double final_value = nn_value;
+            if (mode == MCTS_MODE::SELF_PLAY && config.enable_territory_heuristic)
+            {
+                double territory_score = static_cast<double>(leaf_state_for_expansion.get_territory_score());
+                double heuristic_value = territory_score / (root_state.get_board_size() * root_state.get_board_size());
+                final_value = (1.0 - config.territory_heuristic_weight) * nn_value + config.territory_heuristic_weight * heuristic_value;
+            }
+
+            // 注意：反向传播时，要偿还之前加上的虚拟损失
+            Node *temp_node = leaf;
+            while (temp_node != nullptr) {
+                temp_node->virtual_loss_count_--;
+                temp_node = temp_node->parent_;
+            }
+            leaf->backpropagate(final_value);
         }
+    } // ================== MCTS 主循环结束 ==================
 
-        int action = -1;
-        std::vector<float> action_probs(root_state.get_board_size() * root_state.get_board_size(), 0.0f);
+    // ================== 【修正点 4】: 在所有模拟完成后，再计算最终策略并返回 ==================
+    int action = -1;
+    std::vector<float> action_probs(root_state.get_board_size() * root_state.get_board_size(), 0.0f);
 
-        if (!root->children_.empty())
+    if (!root->children_.empty())
+    {
+        float sum_visits = 0;
+        for (const auto &child : root->children_)
         {
-            float sum_visits = 0;
+            if (child)
+                sum_visits += child->visit_count_;
+        }
+        if (sum_visits > 0)
+        {
             for (const auto &child : root->children_)
             {
                 if (child)
-                    sum_visits += child->visit_count_;
-            }
-            if (sum_visits > 0)
-            {
-                for (const auto &child : root->children_)
-                {
-                    if (child)
-                        action_probs[child->action_taken_] = static_cast<float>(child->visit_count_) / sum_visits;
-                }
+                    action_probs[child->action_taken_] = static_cast<float>(child->visit_count_) / sum_visits;
             }
         }
-
-        double temperature = 0.0;
-        if (mode == MCTS_MODE::SELF_PLAY)
-        {
-            // 使用 config 来获取温度参数, 确保这里没有 this 或 args
-            temperature = (root_state.get_move_number() < config.temperature_decay_moves)
-                              ? config.temperature_start
-                              : config.temperature_end;
-        }
-
-        if (temperature > 0.01 && !root->children_.empty())
-        {
-            // 温度采样 (探索性)
-            std::vector<double> powered_visits;
-            std::vector<int> actions;
-            for (const auto &child : root->children_)
-            {
-                if (child)
-                {
-                    powered_visits.push_back(std::pow(static_cast<double>(child->visit_count_), 1.0 / temperature));
-                    actions.push_back(child->action_taken_);
-                }
-            }
-            if (!actions.empty())
-            {
-                static thread_local std::mt19937 generator(std::random_device{}());
-                std::discrete_distribution<int> dist(powered_visits.begin(), powered_visits.end());
-                action = actions[dist(generator)];
-            }
-        }
-        else if (!root->children_.empty())
-        {
-            // 贪婪选择 (确定性)
-            int max_visits = -1;
-            std::vector<int> best_actions;
-            for (const auto &child : root->children_)
-            {
-                if (child && child->visit_count_ > max_visits)
-                {
-                    max_visits = child->visit_count_;
-                }
-            }
-            for (const auto &child : root->children_)
-            {
-                if (child && child->visit_count_ == max_visits)
-                {
-                    best_actions.push_back(child->action_taken_);
-                }
-            }
-            if (!best_actions.empty())
-            {
-                static thread_local std::mt19937 generator(std::random_device{}());
-                std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
-                action = best_actions[dist(generator)];
-            }
-        }
-
-        // 如果没选出动作，随机选一个
-        if (action == -1)
-        {
-            auto valid_moves = root_state.get_valid_moves();
-            std::vector<int> valid_move_indices;
-            for (size_t i = 0; i < valid_moves.size(); ++i)
-            {
-                if (valid_moves[i])
-                    valid_move_indices.push_back(i);
-            }
-            if (!valid_move_indices.empty())
-            {
-                std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
-                static thread_local std::mt19937 generator(std::random_device{}());
-                action = valid_move_indices[distrib(generator)];
-            }
-        }
-
-        return {action, action_probs};
     }
+
+    // 根据模式选择最终动作 (温度采样或贪心选择)
+    double temperature = 0.0;
+    if (mode == MCTS_MODE::SELF_PLAY)
+    {
+        temperature = (root_state.get_move_number() < config.temperature_decay_moves)
+                          ? config.temperature_start
+                          : config.temperature_end;
+    }
+
+    if (temperature > 0.01 && !root->children_.empty())
+    {
+        // 温度采样
+        std::vector<double> powered_visits;
+        std::vector<int> actions;
+        for (const auto &child : root->children_)
+        {
+            if (child)
+            {
+                powered_visits.push_back(std::pow(static_cast<double>(child->visit_count_), 1.0 / temperature));
+                actions.push_back(child->action_taken_);
+            }
+        }
+        if (!actions.empty())
+        {
+            static thread_local std::mt19937 generator(std::random_device{}());
+            std::discrete_distribution<int> dist(powered_visits.begin(), powered_visits.end());
+            action = actions[dist(generator)];
+        }
+    }
+    else if (!root->children_.empty())
+    {
+        // 贪婪选择
+        int max_visits = -1;
+        std::vector<int> best_actions;
+        for (const auto &child : root->children_)
+        {
+            if (child && child->visit_count_ > max_visits)
+            {
+                max_visits = child->visit_count_;
+                best_actions.clear();
+                best_actions.push_back(child->action_taken_);
+            } else if (child && child->visit_count_ == max_visits) {
+                best_actions.push_back(child->action_taken_);
+            }
+        }
+        if (!best_actions.empty())
+        {
+            static thread_local std::mt19937 generator(std::random_device{}());
+            std::uniform_int_distribution<size_t> dist(0, best_actions.size() - 1);
+            action = best_actions[dist(generator)];
+        }
+    }
+
+    // 如果没选出动作 (例如，根节点是终局)，随机选择一个合法动作
+    if (action == -1)
+    {
+        auto valid_moves = root_state.get_valid_moves();
+        std::vector<int> valid_move_indices;
+        for (size_t i = 0; i < valid_moves.size(); ++i)
+        {
+            if (valid_moves[i])
+                valid_move_indices.push_back(i);
+        }
+        if (!valid_move_indices.empty())
+        {
+            std::uniform_int_distribution<> distrib(0, valid_move_indices.size() - 1);
+            static thread_local std::mt19937 generator(std::random_device{}());
+            action = valid_move_indices[distrib(generator)];
+        }
+    }
+
+    return {action, action_probs};
 }
 
 // =============================================================
