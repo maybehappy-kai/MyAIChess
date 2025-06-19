@@ -7,22 +7,17 @@
 #include <iostream> // 为了 std::cout
 
 // 构造函数
-Node::Node(std::shared_ptr<const Gomoku> game_state, Node* parent, int action_taken, float prior)
+Node::Node(Node* parent, int action_taken, float prior)
     : parent_(parent),
       action_taken_(action_taken),
       prior_(prior),
       visit_count_(0),
       value_sum_(0.0),
-      virtual_loss_count_(0),
-      game_state_(std::move(game_state)) {} // <-- 现在这里移动的是一个轻量的指针
+      virtual_loss_count_(0) {} // 移除了 game_state_ 的初始化
 
 Node::~Node() {
-    // 使用循环销毁子节点，避免递归引起的栈溢出
-    while (!children_.empty()) {
-        auto child_ptr = std::move(children_.back());
-        children_.pop_back();
-        // child_ptr 在此处超出作用域时会被安全删除
-    }
+    // 不需要做任何事情了！
+    // 所有子节点的内存都由Arena统一管理和释放。
 }
 
 
@@ -31,21 +26,22 @@ bool Node::is_fully_expanded() const {
     return !children_.empty();
 }
 
-// 选择UCB值最高的子节点
+// file: cpp_src/Node.cpp (修正后的版本)
+
 Node* Node::select_child(float c_puct) const {
     if (children_.empty()) {
-        // 这是一个安全检查，理论上不应该被触发
         throw std::runtime_error("Select called on a node with no children.");
     }
 
-    Node* best_child = children_[0].get();
+    Node* best_child = children_[0]; // <--- 直接使用，不再调用 .get()
     double best_ucb = get_ucb(best_child, c_puct);
 
     for (size_t i = 1; i < children_.size(); ++i) {
-        const double ucb = get_ucb(children_[i].get(), c_puct);
+        // 直接将 children_[i] (它本身就是 Node*) 传递给 get_ucb
+        const double ucb = get_ucb(children_[i], c_puct);
         if (ucb > best_ucb) {
             best_ucb = ucb;
-            best_child = children_[i].get();
+            best_child = children_[i]; // <--- 直接赋值，不再调用 .get()
         }
     }
     return best_child;

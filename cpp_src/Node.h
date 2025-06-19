@@ -12,7 +12,7 @@ class Node {
 public:
     // 构造函数
     // 使用 std::move 高效地转移 game_state 的所有权
-    Node(std::shared_ptr<const Gomoku> game_state, Node* parent = nullptr, int action_taken = -1, float prior = 0.0f);
+    Node(Node* parent = nullptr, int action_taken = -1, float prior = 0.0f);
 
     // vvv 将默认析构函数修改为自定义声明 vvv
     // ~Node() = default; // <-- 删除或注释掉这一行
@@ -40,10 +40,11 @@ public: // 成员变量设为公有，方便C++ MCTS引擎直接访问，与Pyth
 
     std::atomic<int> virtual_loss_count_;
 
-    // 使用智能指针管理子节点生命周期，父节点拥有子节点
-    std::vector<std::unique_ptr<Node>> children_;
+    std::vector<Node*> children_; // 不再使用智能指针，改为原始指针
 
-    std::shared_ptr<const Gomoku> game_state_;
+    //mutable std::unique_ptr<Gomoku> cached_state_ = nullptr;
+
+    //std::shared_ptr<const Gomoku> game_state_;
 
     // MCTS超参数，从Python端传入
     // 为简化起见，我们可以在select_child中直接传递c_puct，而不是存储整个args字典
