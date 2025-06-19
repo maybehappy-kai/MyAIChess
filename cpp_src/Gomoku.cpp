@@ -392,35 +392,35 @@ BitboardState Gomoku::get_bitboard_state() const {
     return current_state;
 }
 
-// 用下面的新版本替换整个 print_board() 函数
+// file: cpp_src/Gomoku.cpp
+// 用这个版本替换旧的 print_board()
 void Gomoku::print_board() const {
-    std::cout << "--- Board (Player: " << (current_player_ == 1 ? "B" : "W")
-              << ", Move: " << current_move_number_ << ") ---" << std::endl;
+    std::cout << "--- Board (Next to move: " << (current_player_ == 1 ? "B 'X'" : "W 'O'")
+              << ", Total Moves: " << current_move_number_ << ") ---\n";
 
-    // 计算当前双方的领地总数并打印
     int black_score = popcount(black_territory_[0]) + popcount(black_territory_[1]);
     int white_score = popcount(white_territory_[0]) + popcount(white_territory_[1]);
-    std::cout << "--- Territory Score: Black(x) = " << black_score
-              << ", White(o) = " << white_score << " ---" << std::endl;
+    std::cout << "--- Territory: Black(x) = " << black_score
+              << ", White(o) = " << white_score << " ---\n";
+
+    // 打印列号
+    std::cout << "  ";
+    for (int c = 0; c < board_size_; ++c) {
+        std::cout << c << " ";
+    }
+    std::cout << "\n";
 
     for (int r = 0; r < board_size_; ++r) {
+        std::cout << r << " "; // 打印行号
         for (int c = 0; c < board_size_; ++c) {
             const int pos = r * board_size_ + c;
             const int index = pos / 64;
             const uint64_t mask = 1ULL << (pos % 64);
-
-            char piece = '.'; // 默认为空地
-
-            if (black_stones_[index] & mask) {
-                piece = 'X'; // 大写X代表黑棋
-            } else if (white_stones_[index] & mask) {
-                piece = 'O'; // 大写O代表白棋
-            } else if (black_territory_[index] & mask) {
-                piece = 'x'; // 小写x代表黑方领地
-            } else if (white_territory_[index] & mask) {
-                piece = 'o'; // 小写o代表白方领地
-            }
-
+            char piece = '.';
+            if (black_stones_[index] & mask) piece = 'X';
+            else if (white_stones_[index] & mask) piece = 'O';
+            else if (black_territory_[index] & mask) piece = 'x';
+            else if (white_territory_[index] & mask) piece = 'o';
             std::cout << piece << " ";
         }
         std::cout << std::endl;

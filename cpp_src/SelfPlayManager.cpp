@@ -883,6 +883,15 @@ void EvaluationManager::worker_func(int worker_id)
                 }
                 game.execute_move(action);
 
+                {
+                        std::lock_guard<std::mutex> lock(g_io_mutex); // 使用全局锁确保打印不混乱
+                        std::cout << "\n=======================================================\n";
+                        std::cout << "[Eval Game " << game_idx << ", Worker " << worker_id << "] Move #" << game.get_move_number() << "\n";
+                        std::cout << "Player " << game.get_current_player() * -1 << " (Engine: " << ((current_engine == engine1_) ? "Model1-Old" : "Model2-New") << ") chose action: " << action << "\n";
+                        game.print_board();
+                        std::cout << "=======================================================\n";
+                    }
+
                 auto [final_value, is_done] = game.get_game_ended();
                 if (is_done)
                 {
