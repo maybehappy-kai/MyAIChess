@@ -42,6 +42,12 @@ public: // 成员变量设为公有，方便C++ MCTS引擎直接访问，与Pyth
 
     std::vector<Node*> children_; // 不再使用智能指针，改为原始指针
 
+    // vvvvvv 在此处添加以下新行 vvvvvv
+        // 用于缓存该节点游戏状态的指针。
+        // 使用 mutable 关键字，允许我们在 const 成员函数中修改它（即进行缓存操作）
+        mutable std::unique_ptr<Gomoku> cached_state_ = nullptr;
+        // ^^^^^^ 在此处添加以上新行 ^^^^^^
+
     //mutable std::unique_ptr<Gomoku> cached_state_ = nullptr;
 
     //std::shared_ptr<const Gomoku> game_state_;

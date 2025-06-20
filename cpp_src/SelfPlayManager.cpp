@@ -49,7 +49,7 @@ std::shared_ptr<InferenceEngine> get_cached_engine(const std::string &model_path
     return g_engines[model_path];
 }
 // ==============================================================================
-
+/*
 Gomoku reconstruct_game_state(const Node *target_node, const Gomoku &root_state)
 {
     if (target_node->parent_ == nullptr)
@@ -77,6 +77,38 @@ Gomoku reconstruct_game_state(const Node *target_node, const Gomoku &root_state)
         reconstructed_state.execute_move(action);
     }
     return reconstructed_state;
+}
+*/
+
+// file: cpp_src/SelfPlayManager.cpp
+
+// =======================================================
+// ===== 新增：带缓存功能的状态获取函数（最终版） =====
+// =======================================================
+// 返回一个指向节点状态的引用。这个状态要么来自缓存，要么被即时重构并缓存。
+const Gomoku& get_or_reconstruct_state(const Node* target_node, const Gomoku& root_state) {
+    // 1. 如果节点的缓存中已经有状态，直接返回缓存的引用，实现O(1)复杂度的快速访问
+    if (target_node->cached_state_) {
+        return *target_node->cached_state_;
+    }
+
+    // 2. 如果是根节点，它的状态就是root_state，将其制作成一个拷贝并缓存起来
+    if (target_node->parent_ == nullptr) {
+        target_node->cached_state_ = std::make_unique<Gomoku>(root_state);
+        return *target_node->cached_state_;
+    }
+
+    // 3. 缓存未命中，且不是根节点，需要重构
+    // 关键：我们递归地获取父节点的状态。这一步会充分利用沿途所有节点的缓存，
+    // 避免了每次都从最顶层的根节点开始重构的巨大浪费。
+    const Gomoku& parent_state = get_or_reconstruct_state(target_node->parent_, root_state);
+
+    // 4. 从已经获取到的父节点状态，仅需再走一步，就能得到当前节点的状态。
+    // 然后将其存入当前节点的缓存中，以备后续使用。
+    target_node->cached_state_ = std::make_unique<Gomoku>(parent_state);
+    target_node->cached_state_->execute_move(target_node->action_taken_);
+
+    return *target_node->cached_state_;
 }
 
 // ==================== 新增：历史收集辅助函数 ====================
@@ -307,7 +339,7 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
 {
     // 竞技场和根节点初始化 (保持不变)
     auto root = std::make_unique<Node>(nullptr, -1, 1.0f);
-    Arena arena(256 * 1024 * 1024);
+    Arena arena(128 * 1024 * 1024);
 
     // ================== MCTS 主循环 (修正循环结构) ==================
     for (int i = 0; i < config.num_simulations; i += config.mcts_batch_size)
@@ -327,7 +359,7 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
             }
 
             // 检查叶子节点是否是终局状态
-            Gomoku current_node_state = reconstruct_game_state(node, root_state);
+            const Gomoku& current_node_state = get_or_reconstruct_state(node, root_state);
             auto [end_value, is_terminal] = current_node_state.get_game_ended();
 
             if (is_terminal)
@@ -357,7 +389,7 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
         state_batch.reserve(leaves_batch.size());
         for (const auto *leaf : leaves_batch)
         {
-            Gomoku leaf_state = reconstruct_game_state(leaf, root_state);
+            const Gomoku& leaf_state = get_or_reconstruct_state(leaf, root_state);
             std::deque<BitboardState> leaf_history = gather_history_for_leaf(
                 leaf, root_state, history, config.history_steps);
             state_batch.push_back(leaf_state.get_state(leaf_history));
@@ -367,11 +399,14 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
         // ================== 1c. 扩展和反向传播 (结构优化版) ==================
         for (size_t k = 0; k < leaves_batch.size(); ++k)
         {
-            Node* leaf = leaves_batch[k];
+            Node *leaf = leaves_batch[k];
             auto current_policy = policy_batch[k];
+            //【必须保留】从批处理结果中获取神经网络的价值预测
             double nn_value = static_cast<double>(value_batch[k]);
-            Gomoku leaf_state_for_expansion = reconstruct_game_state(leaf, root_state);
+            //【应用修改】使用新的、带缓存的函数获取状态
+            const Gomoku& leaf_state_for_expansion = get_or_reconstruct_state(leaf, root_state);
 
+            // ... 后续的启发式策略、扩展和反向传播逻辑 ...
             // --- 根节点专属逻辑区 ---
             // 所有只在根节点应用的启发式策略都集中于此
             if (leaf == root.get())
