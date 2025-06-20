@@ -591,6 +591,20 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
         }
     }
 
+    // --- 新增：强制最终归一化，确保总和为1 ---
+        float final_policy_sum = 0.0f;
+        for(float p : action_probs) {
+            final_policy_sum += p;
+        }
+
+        // 只有在总和大于0时才进行除法，避免除以零的错误
+        if (final_policy_sum > 1e-6) { // 使用一个小的阈值以应对浮点数精度问题
+            for (float& p : action_probs) {
+                p /= final_policy_sum;
+            }
+        }
+        // --- 修正结束 ---
+
     return {action, action_probs};
 }
 
