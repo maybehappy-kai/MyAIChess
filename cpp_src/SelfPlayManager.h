@@ -14,7 +14,8 @@ extern std::mutex g_io_mutex;
 namespace py = pybind11;
 
 // ==================== MCTS配置结构体 (保持不变) ====================
-struct MCTS_Config {
+struct MCTS_Config
+{
     int num_simulations;
     int mcts_batch_size;
     double c_puct;
@@ -38,7 +39,8 @@ struct MCTS_Config {
 
 using TrainingDataPacket = std::vector<std::tuple<std::vector<float>, std::vector<float>, double>>;
 
-class SelfPlayManager {
+class SelfPlayManager
+{
 public:
     SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::object final_data_queue, py::dict args);
     void run();
@@ -85,14 +87,14 @@ private:
 };
 
 // ====================== 评估 (Evaluation) 部分的声明 ======================
-class EvaluationManager {
+class EvaluationManager
+{
 public:
     EvaluationManager(
         std::shared_ptr<InferenceEngine> engine1,
         std::shared_ptr<InferenceEngine> engine2,
         py::dict args,
-        int mode
-    );
+        int mode);
     void run();
     py::dict get_results() const;
 
@@ -126,22 +128,20 @@ private:
 };
 
 // --- 顶层函数声明 (保持不变) ---
-void run_parallel_self_play(const std::string& model_path, bool use_gpu, py::object final_data_queue, py::dict args);
+void run_parallel_self_play(const std::string &model_path, bool use_gpu, py::object final_data_queue, py::dict args);
 
 py::dict run_parallel_evaluation(
-    const std::string& model1_path,
-    const std::string& model2_path,
+    const std::string &model1_path,
+    const std::string &model2_path,
     bool use_gpu,
     py::dict args,
-    int mode
-);
+    int mode);
 
 int find_best_action_for_state(
     py::list board_pieces,
     py::list board_territory,
     int current_player,
     int current_move_number,
-    const std::string& model_path,
+    const std::string &model_path,
     bool use_gpu,
-    py::dict args
-);
+    py::dict args);

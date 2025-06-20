@@ -10,14 +10,16 @@
 #include <array>
 
 // 用于存储单步历史的位棋盘状态结构体
-struct BitboardState {
+struct BitboardState
+{
     uint64_t black_stones[2];
     uint64_t white_stones[2];
     uint64_t black_territory[2];
     uint64_t white_territory[2];
 };
 
-class Gomoku {
+class Gomoku
+{
 public:
     // 静态常量
     static constexpr int EMPTY_SLOT = 0;
@@ -37,26 +39,25 @@ public:
         const uint64_t white_s[2],
         const uint64_t black_t[2],
         const uint64_t white_t[2],
-        int history_steps = 0
-    );
+        int history_steps = 0);
 
     // 深拷贝
-    Gomoku(const Gomoku& other);
-    Gomoku& operator=(const Gomoku& other);
+    Gomoku(const Gomoku &other);
+    Gomoku &operator=(const Gomoku &other);
 
     // 公有方法
     void reset();
     void execute_move(int action);
     std::vector<bool> get_valid_moves() const;
     std::pair<double, bool> get_game_ended() const;
-    std::vector<float> get_state(const std::deque<BitboardState>& history) const;
+    std::vector<float> get_state(const std::deque<BitboardState> &history) const;
     int get_current_player() const;
     int get_board_size() const;
     int get_move_number() const;
     int get_territory_score() const;
     BitboardState get_bitboard_state() const;
-    const uint64_t* get_player_stones_bitboard() const;
-    const uint64_t* get_player_territory_bitboard() const;
+    const uint64_t *get_player_stones_bitboard() const;
+    const uint64_t *get_player_territory_bitboard() const;
 
     std::map<int, int> calculate_scores() const;
 
@@ -68,7 +69,7 @@ public:
 private:
     // 私有方法
     void process_patterns_and_territory(int r, int c);
-    //std::map<int, int> calculate_scores() const;
+    // std::map<int, int> calculate_scores() const;
 
     // 成员变量
     const int board_size_;
@@ -85,5 +86,5 @@ private:
     uint64_t white_territory_[2];
 
     // 历史状态队列
-    //std::deque<BitboardState> history_;
+    // std::deque<BitboardState> history_;
 };

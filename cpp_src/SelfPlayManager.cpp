@@ -7,12 +7,18 @@
 #include "Gomoku.h"
 #include "Node.h"
 #include "SafeQueue.h"
-#include "Arena.h"
+#include "TrivialArena.h"
 
-struct MCTS_Config; // 先声明MCTS_Config结构体
-enum class MCTS_MODE;  // 再声明MCTS_MODE枚举
-std::pair<int, std::vector<float>> find_best_action_by_mcts(const Gomoku&, const std::deque<BitboardState>&, InferenceEngine&, const MCTS_Config&, MCTS_MODE);
-
+struct MCTS_Config;   // 先声明MCTS_Config结构体
+enum class MCTS_MODE; // 再声明MCTS_MODE枚举
+std::pair<int, std::vector<float>> find_best_action_by_mcts(
+    const Gomoku &root_state,
+    const std::deque<BitboardState> &history,
+    InferenceEngine &engine,
+    const MCTS_Config &config,
+    MCTS_MODE mode,
+    TrivialArena &node_arena,
+    TrivialArena &gomoku_arena);
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -83,30 +89,38 @@ Gomoku reconstruct_game_state(const Node *target_node, const Gomoku &root_state)
 // file: cpp_src/SelfPlayManager.cpp
 
 // =======================================================
-// ===== 新增：带缓存功能的状态获取函数（最终版） =====
+// ===== 带缓存功能的状态获取函数（双竞技场最终版） =====
 // =======================================================
-// 返回一个指向节点状态的引用。这个状态要么来自缓存，要么被即时重构并缓存。
-const Gomoku& get_or_reconstruct_state(const Node* target_node, const Gomoku& root_state) {
-    // 1. 如果节点的缓存中已经有状态，直接返回缓存的引用，实现O(1)复杂度的快速访问
+const Gomoku& get_or_reconstruct_state(
+    const Node* target_node,
+    const Gomoku& root_state,
+    TrivialArena& gomoku_arena // <-- 接收竞技场
+) {
+    // 1. 缓存命中，直接返回 (逻辑不变)
     if (target_node->cached_state_) {
         return *target_node->cached_state_;
     }
 
-    // 2. 如果是根节点，它的状态就是root_state，将其制作成一个拷贝并缓存起来
+    // 2. 如果是根节点，使用 gomoku_arena 创建缓存
     if (target_node->parent_ == nullptr) {
-        target_node->cached_state_ = std::make_unique<Gomoku>(root_state);
+        // vvvvvv 【核心修改】 vvvvvv
+        // 使用 placement new 在竞技场上构造 Gomoku 对象
+        target_node->cached_state_ = new (gomoku_arena.allocate<Gomoku>()) Gomoku(root_state);
+        // ^^^^^^ 【核心修改】 ^^^^^^
         return *target_node->cached_state_;
     }
 
-    // 3. 缓存未命中，且不是根节点，需要重构
-    // 关键：我们递归地获取父节点的状态。这一步会充分利用沿途所有节点的缓存，
-    // 避免了每次都从最顶层的根节点开始重构的巨大浪费。
-    const Gomoku& parent_state = get_or_reconstruct_state(target_node->parent_, root_state);
+    // 3. 缓存未命中，递归调用，并传入竞技场
+    // vvvvvv 【核心修改】 vvvvvv
+    const Gomoku& parent_state = get_or_reconstruct_state(target_node->parent_, root_state, gomoku_arena);
+    // ^^^^^^ 【核心修改】 ^^^^^^
 
-    // 4. 从已经获取到的父节点状态，仅需再走一步，就能得到当前节点的状态。
-    // 然后将其存入当前节点的缓存中，以备后续使用。
-    target_node->cached_state_ = std::make_unique<Gomoku>(parent_state);
-    target_node->cached_state_->execute_move(target_node->action_taken_);
+    // 4. 使用 gomoku_arena 创建子节点的状态缓存
+    // vvvvvv 【核心修改】 vvvvvv
+    Gomoku* new_state = new (gomoku_arena.allocate<Gomoku>()) Gomoku(parent_state);
+    new_state->execute_move(target_node->action_taken_);
+    target_node->cached_state_ = new_state;
+    // ^^^^^^ 【核心修改】 ^^^^^^
 
     return *target_node->cached_state_;
 }
@@ -227,21 +241,23 @@ void add_dirichlet_noise(
 
 // ====================== 领地内落子惩罚函数 (最终版) ======================
 void apply_territory_penalty(
-    std::vector<float>& policy,
-    const Gomoku& game_state,
+    std::vector<float> &policy,
+    const Gomoku &game_state,
     float penalty_strength)
 {
     // 获取当前玩家的领地位棋盘
-    const uint64_t* player_territory = game_state.get_player_territory_bitboard();
+    const uint64_t *player_territory = game_state.get_player_territory_bitboard();
     const int board_size = game_state.get_board_size();
 
     // 遍历棋盘上的每一个点
-    for (int action = 0; action < board_size * board_size; ++action) {
+    for (int action = 0; action < board_size * board_size; ++action)
+    {
         const int index = action / 64;
         const uint64_t mask = 1ULL << (action % 64);
 
         // 检查这个点是否已经是当前玩家的领地
-        if ((player_territory[index] & mask) != 0) {
+        if ((player_territory[index] & mask) != 0)
+        {
             // 如果是，直接将此处的策略概率乘以一个惩罚系数
             // penalty_strength=0.5 意味着将此处的概率减半
             // penalty_strength=1.0 意味着将此处概率降为0
@@ -251,21 +267,26 @@ void apply_territory_penalty(
 
     // 重新归一化策略概率，确保总和为1
     float policy_sum = 0.0f;
-    for (float p : policy) {
+    for (float p : policy)
+    {
         // 确保不加负数
-        if (p > 0) policy_sum += p;
+        if (p > 0)
+            policy_sum += p;
     }
-    if (policy_sum > 0.0f) {
-        for (float& p : policy) {
-            if (p > 0) p /= policy_sum;
+    if (policy_sum > 0.0f)
+    {
+        for (float &p : policy)
+        {
+            if (p > 0)
+                p /= policy_sum;
         }
     }
 }
 
 // ====================== 新增：无效连接惩罚函数 ======================
 void apply_ineffective_connection_penalty(
-    std::vector<float>& policy,
-    const Gomoku& game_state,
+    std::vector<float> &policy,
+    const Gomoku &game_state,
     float penalty_factor)
 {
     const int board_size = game_state.get_board_size();
@@ -308,12 +329,17 @@ void apply_ineffective_connection_penalty(
 
     // 7. 重新归一化策略，确保总和为1
     float policy_sum = 0.0f;
-    for (float p : policy) {
-        if (p > 0) policy_sum += p;
+    for (float p : policy)
+    {
+        if (p > 0)
+            policy_sum += p;
     }
-    if (policy_sum > 0.0f) {
-        for (float& p : policy) {
-            if (p > 0) p /= policy_sum;
+    if (policy_sum > 0.0f)
+    {
+        for (float &p : policy)
+        {
+            if (p > 0)
+                p /= policy_sum;
         }
     }
 }
@@ -328,20 +354,26 @@ enum class MCTS_MODE
     EVALUATION // 用于评估或人机对战，确定性的贪婪选择
 };
 
-// file: cpp_src/SelfPlayManager.cpp
-// 请用这个【完整、干净】的函数替换掉你文件中的旧函数
-
+// file: cpp_src/SelfPlayManager.cpp (文件中部)
+// vvvvvv 【核心修改】 vvvvvv
 std::pair<int, std::vector<float>> find_best_action_by_mcts(
     const Gomoku &root_state,
     const std::deque<BitboardState> &history,
     InferenceEngine &engine,
     const MCTS_Config &config,
-    MCTS_MODE mode)
+    MCTS_MODE mode,
+    TrivialArena &node_arena,  // <-- 新增参数
+    TrivialArena &gomoku_arena // <-- 新增参数
+)
 {
-    // 竞技场和根节点初始化 (保持不变)
+    // 竞技场和根节点初始化
     auto root = std::make_unique<Node>(nullptr, -1, 1.0f);
-    Arena arena(128 * 1024 * 1024);
+    // Arena arena(128 * 1024 * 1024); // <-- 【重要】删除这一行！竞技场现在由外部传入
 
+    // 在使用前先重置竞技场，确保它们是干净的
+    node_arena.reset();
+    gomoku_arena.reset();
+    // ...
     // ================== MCTS 主循环 (修正循环结构) ==================
     for (int i = 0; i < config.num_simulations; i += config.mcts_batch_size)
     {
@@ -360,7 +392,7 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
             }
 
             // 检查叶子节点是否是终局状态
-            const Gomoku& current_node_state = get_or_reconstruct_state(node, root_state);
+            const Gomoku& current_node_state = get_or_reconstruct_state(node, root_state, gomoku_arena);
             auto [end_value, is_terminal] = current_node_state.get_game_ended();
 
             if (is_terminal)
@@ -390,7 +422,7 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
         state_batch.reserve(leaves_batch.size());
         for (const auto *leaf : leaves_batch)
         {
-            const Gomoku& leaf_state = get_or_reconstruct_state(leaf, root_state);
+            const Gomoku& leaf_state = get_or_reconstruct_state(leaf, root_state, gomoku_arena);
             std::deque<BitboardState> leaf_history = gather_history_for_leaf(
                 leaf, root_state, history, config.history_steps);
             state_batch.push_back(leaf_state.get_state(leaf_history));
@@ -402,10 +434,10 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
         {
             Node *leaf = leaves_batch[k];
             auto current_policy = policy_batch[k];
-            //【必须保留】从批处理结果中获取神经网络的价值预测
+            // 【必须保留】从批处理结果中获取神经网络的价值预测
             double nn_value = static_cast<double>(value_batch[k]);
-            //【应用修改】使用新的、带缓存的函数获取状态
-            const Gomoku& leaf_state_for_expansion = get_or_reconstruct_state(leaf, root_state);
+            // 【应用修改】使用新的、带缓存的函数获取状态
+            const Gomoku& leaf_state_for_expansion = get_or_reconstruct_state(leaf, root_state, gomoku_arena);
 
             // ... 后续的启发式策略、扩展和反向传播逻辑 ...
             // --- 根节点专属逻辑区 ---
@@ -421,24 +453,33 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
                         const int board_size = leaf_state_for_expansion.get_board_size();
                         float bias_strength = config.opening_bias_strength;
                         std::vector<float> opening_bias(board_size * board_size, 0.0f);
-                        for (int r = 0; r < board_size; ++r) {
-                            for (int c = 0; c < board_size; ++c) {
+                        for (int r = 0; r < board_size; ++r)
+                        {
+                            for (int c = 0; c < board_size; ++c)
+                            {
                                 int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
                                 float bias = 0.0f;
-                                if (dist_from_edge == 0) bias = 0.1f;
-                                else if (dist_from_edge == 1) bias = 0.4f;
-                                else if (dist_from_edge == 2) bias = 0.8f;
-                                else bias = 1.0f;
+                                if (dist_from_edge == 0)
+                                    bias = 0.1f;
+                                else if (dist_from_edge == 1)
+                                    bias = 0.4f;
+                                else if (dist_from_edge == 2)
+                                    bias = 0.8f;
+                                else
+                                    bias = 1.0f;
                                 opening_bias[r * board_size + c] = bias;
                             }
                         }
                         float policy_sum = 0.0f;
-                        for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i) {
+                        for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i)
+                        {
                             current_policy[pol_i] += bias_strength * opening_bias[pol_i];
                             policy_sum += current_policy[pol_i];
                         }
-                        if (policy_sum > 0.0f) {
-                            for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i) {
+                        if (policy_sum > 0.0f)
+                        {
+                            for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i)
+                            {
                                 current_policy[pol_i] /= policy_sum;
                             }
                         }
@@ -450,15 +491,17 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
 
                 // Part 2: 在“所有模式”下对根节点生效的策略惩罚
                 // (新位置) 领地维持惩罚
-                if (config.enable_territory_penalty) {
+                if (config.enable_territory_penalty)
+                {
                     apply_territory_penalty(current_policy, leaf_state_for_expansion, config.territory_penalty_strength);
                 }
 
                 // ★★★ 新增调用点：在这里应用新的惩罚函数 ★★★
-                            // 这个位置确保了它在训练、评估、对战时都生效
-                            if (config.enable_ineffective_connection_penalty) {
-                                apply_ineffective_connection_penalty(current_policy, leaf_state_for_expansion, config.ineffective_connection_penalty_factor);
-                            }
+                // 这个位置确保了它在训练、评估、对战时都生效
+                if (config.enable_ineffective_connection_penalty)
+                {
+                    apply_ineffective_connection_penalty(current_policy, leaf_state_for_expansion, config.ineffective_connection_penalty_factor);
+                }
             }
 
             // --- 通用逻辑区 ---
@@ -472,7 +515,10 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
                 {
                     try
                     {
-                        Node *child_node = new (arena.allocate<Node>()) Node(leaf, action, current_policy[action]);
+                        // vvvvvv 【核心修正】 vvvvvv
+                        // 使用传入的 node_arena 来分配 Node 对象
+                        Node *child_node = new (node_arena.allocate<Node>()) Node(leaf, action, current_policy[action]);
+                        // ^^^^^^ 【核心修正】 ^^^^^^
                         leaf->children_.push_back(child_node);
                     }
                     catch (const std::bad_alloc &)
@@ -561,7 +607,9 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
                 max_visits = child->visit_count_;
                 best_actions.clear();
                 best_actions.push_back(child->action_taken_);
-            } else if (child && child->visit_count_ == max_visits) {
+            }
+            else if (child && child->visit_count_ == max_visits)
+            {
                 best_actions.push_back(child->action_taken_);
             }
         }
@@ -592,18 +640,21 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
     }
 
     // --- 新增：强制最终归一化，确保总和为1 ---
-        float final_policy_sum = 0.0f;
-        for(float p : action_probs) {
-            final_policy_sum += p;
-        }
+    float final_policy_sum = 0.0f;
+    for (float p : action_probs)
+    {
+        final_policy_sum += p;
+    }
 
-        // 只有在总和大于0时才进行除法，避免除以零的错误
-        if (final_policy_sum > 1e-6) { // 使用一个小的阈值以应对浮点数精度问题
-            for (float& p : action_probs) {
-                p /= final_policy_sum;
-            }
+    // 只有在总和大于0时才进行除法，避免除以零的错误
+    if (final_policy_sum > 1e-6)
+    { // 使用一个小的阈值以应对浮点数精度问题
+        for (float &p : action_probs)
+        {
+            p /= final_policy_sum;
         }
-        // --- 修正结束 ---
+    }
+    // --- 修正结束 ---
 
     return {action, action_probs};
 }
@@ -773,6 +824,8 @@ void SelfPlayManager::worker_func(int worker_id)
 
         try
         {
+            TrivialArena node_arena(100 * 1024 * 1024);  // 100MB 给 Node
+            TrivialArena gomoku_arena(32 * 1024 * 1024); // 32MB 给 Gomoku 缓存
             Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
             std::deque<BitboardState> game_history;
             std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
@@ -806,7 +859,10 @@ void SelfPlayManager::worker_func(int worker_id)
                     game_history,
                     *engine_,
                     this->mcts_config_,
-                    MCTS_MODE::SELF_PLAY);
+                    MCTS_MODE::SELF_PLAY,
+                    node_arena,  // <-- 传入node_arena
+                    gomoku_arena // <-- 传入gomoku_arena
+                );
 
                 // 3. 存储【有效】的训练数据
                 episode_data.emplace_back(root_state.get_state(game_history), action_probs, game.get_current_player());
@@ -894,9 +950,9 @@ EvaluationManager::EvaluationManager(
     this->mcts_config_.temperature_end = 0.0;
     this->mcts_config_.temperature_decay_moves = 0;
 
-    this->scores_[1] = 0;   // 为"模型1胜利"初始化
-    this->scores_[-1] = 0;  // 为"模型2胜利"初始化
-    this->scores_[0] = 0;   // 为"平局"初始化
+    this->scores_[1] = 0;  // 为"模型1胜利"初始化
+    this->scores_[-1] = 0; // 为"模型2胜利"初始化
+    this->scores_[0] = 0;  // 为"平局"初始化
 }
 
 py::dict EvaluationManager::get_results() const
@@ -941,7 +997,8 @@ void EvaluationManager::worker_func(int worker_id)
         try
         {
             // ... 在 EvaluationManager::worker_func 的 try 块内部 ...
-
+            TrivialArena node_arena(100 * 1024 * 1024);
+            TrivialArena gomoku_arena(32 * 1024 * 1024);
             Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
             std::deque<BitboardState> game_history;
 
@@ -953,10 +1010,13 @@ void EvaluationManager::worker_func(int worker_id)
             // mode 0: 交替先后手
             bool swap_models = (evaluation_mode_ == 2) || (evaluation_mode_ == 0 && game_idx % 2 != 0);
 
-            if (swap_models) {
+            if (swap_models)
+            {
                 p1_engine = engine2_; // 新模型执黑 (P1)
                 p2_engine = engine1_; // 旧模型执白 (P2)
-            } else {
+            }
+            else
+            {
                 p1_engine = engine1_; // 旧模型执黑 (P1)
                 p2_engine = engine2_; // 新模型执白 (P2)
             }
@@ -976,7 +1036,9 @@ void EvaluationManager::worker_func(int worker_id)
                     game_history,
                     *current_engine,
                     this->mcts_config_,
-                    MCTS_MODE::EVALUATION // 指定为评估模式
+                    MCTS_MODE::EVALUATION, // 指定为评估模式
+                    node_arena,            // <-- 传入node_arena
+                    gomoku_arena           // <-- 传入gomoku_arena
                 );
                 // 在评估中，我们不关心返回的policy，所以可以忽略
 
@@ -1086,8 +1148,8 @@ int find_best_action_for_state(
     // ====================== 【核心修正】 ======================
     // 修正了通道数的计算逻辑，确保与Python训练时完全一致
     int history_steps = args["history_steps"].cast<int>();
-    int state_channels = (history_steps + 1) * 4; // (历史步数 + 当前状态) * 4个平面
-    int meta_channels = 4; // 4个元数据平面
+    int state_channels = (history_steps + 1) * 4;         // (历史步数 + 当前状态) * 4个平面
+    int meta_channels = 4;                                // 4个元数据平面
     config.num_channels = state_channels + meta_channels; // 总通道数，(3+1)*4 + 4 = 20
     // =========================================================
 
@@ -1118,16 +1180,24 @@ int find_best_action_for_state(
         for (int c = 0; c < board_size; ++c)
         {
             int piece = row_p[c].cast<int>();
-            if (piece != 0) {
+            if (piece != 0)
+            {
                 int pos = r * board_size + c;
                 uint64_t mask = 1ULL << (pos % 64);
-                if (piece == 1) black_s[pos / 64] |= mask; else white_s[pos / 64] |= mask;
+                if (piece == 1)
+                    black_s[pos / 64] |= mask;
+                else
+                    white_s[pos / 64] |= mask;
             }
             int territory = row_t[c].cast<int>();
-            if (territory != 0) {
+            if (territory != 0)
+            {
                 int pos = r * board_size + c;
                 uint64_t mask = 1ULL << (pos % 64);
-                if (territory == 1) black_t[pos / 64] |= mask; else white_t[pos / 64] |= mask;
+                if (territory == 1)
+                    black_t[pos / 64] |= mask;
+                else
+                    white_t[pos / 64] |= mask;
             }
         }
     }
@@ -1137,11 +1207,13 @@ int find_best_action_for_state(
     Gomoku root_state(
         board_size, num_rounds,
         current_player, current_move_number,
-        black_s, white_s, black_t, white_t, config.history_steps
-    );
+        black_s, white_s, black_t, white_t, config.history_steps);
 
     // 为人机对战创建一个空的history deque
     std::deque<BitboardState> history;
+
+    TrivialArena node_arena(100 * 1024 * 1024);
+    TrivialArena gomoku_arena(32 * 1024 * 1024);
 
     int final_action = -1;
     {
@@ -1154,7 +1226,9 @@ int find_best_action_for_state(
             history,
             *engine,
             config,
-            MCTS_MODE::EVALUATION
+            MCTS_MODE::EVALUATION,
+            node_arena,  // <-- 传入node_arena
+            gomoku_arena // <-- 传入gomoku_arena
         );
         final_action = best_action;
     }
