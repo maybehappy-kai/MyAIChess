@@ -37,9 +37,9 @@ args = {
     'enable_opening_bias': True,  # True 表示启用开局偏置
     'opening_bias_strength': 0.1,  # 偏置的总体强度
 
-    # 活二威胁检测参数
-    'enable_threat_detection': False,  # [之前缺失] True 表示启用威胁检测
-    'threat_detection_bonus': 10.0,  # 威胁点的额外奖励值
+    # 无效连接惩罚参数
+    'enable_ineffective_connection_penalty': True,      # True 表示启用该惩罚
+    'ineffective_connection_penalty_factor': 0.1,       # 惩罚系数(将无收益三连的策略概率乘以该系数)
 
     # 领地价值启发参数
     'enable_territory_heuristic': True,  # [之前缺失] True 表示启用领地启发

@@ -22,8 +22,8 @@ struct MCTS_Config {
     int num_channels;
     bool enable_opening_bias;
     float opening_bias_strength;
-    bool enable_threat_detection;
-    float threat_detection_bonus;
+    bool enable_ineffective_connection_penalty;
+    float ineffective_connection_penalty_factor;
     bool enable_territory_heuristic;
     double territory_heuristic_weight;
     double dirichlet_alpha;

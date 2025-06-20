@@ -216,7 +216,11 @@ std::vector<bool> Gomoku::get_valid_moves() const {
     return valid_moves;
 }
 
+// file: cpp_src/Gomoku.cpp
+
+// 请用这个新版本的函数，完整替换旧的同名函数
 std::pair<double, bool> Gomoku::get_game_ended() const {
+    // 1. 检查总步数是否达到上限
     if (current_move_number_ >= max_total_moves_) {
         auto scores = calculate_scores();
         int black_score = scores.at(PLAYER_BLACK);
@@ -224,8 +228,27 @@ std::pair<double, bool> Gomoku::get_game_ended() const {
         double winner_val = 0.0;
         if (black_score > white_score) winner_val = 1.0;
         else if (white_score > black_score) winner_val = -1.0;
+        // 如果平局，返回一个极小值，避免被误认为是未结束
         return {winner_val == 0.0 ? 0.001 : winner_val, true};
     }
+
+    // 2.【新增的核心逻辑】检查当前玩家是否还有合法的落子点
+    auto valid_moves = get_valid_moves();
+    bool has_valid_move = false;
+    for(bool move_is_valid : valid_moves) {
+        if (move_is_valid) {
+            has_valid_move = true;
+            break;
+        }
+    }
+
+    if (!has_valid_move) {
+        // 如果当前玩家无路可走，则对方获胜
+        // 对方玩家的值是 -current_player_ (例如，当前是黑1，则白-1获胜)
+        return {static_cast<double>(-current_player_), true};
+    }
+
+    // 3. 如果以上条件都不满足，说明游戏尚未结束
     return {0.0, false};
 }
 

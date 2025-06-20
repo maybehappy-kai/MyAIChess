@@ -19,34 +19,34 @@ import platform
 import ctypes
 
 
-def get_augmented_data(state, policy, board_size):
+# file: coach.py
+
+# 请用这个健壮的版本，替换掉 coach.py 文件中旧的同名函数
+def get_augmented_data(state, policy, board_size, num_channels):
     """
     对单个训练样本进行8种对称变换的数据增强。
-    :param state: Numpy array, 形状为 (6, board_size, board_size)
-    :param policy: Numpy array, 形状为 (board_size * board_size,)
-    :param board_size: 棋盘大小
-    :return: 一个包含8个 (state, policy) 元组的列表
+    此版本确保所有增强数据都是独立的内存副本。
     """
+    # 将一维的 state 和 policy 转换为 numpy 数组并重塑为空间矩阵
+    state_np = np.array(state).reshape(num_channels, board_size, board_size)
+    policy_np = np.array(policy).reshape(board_size, board_size)
+
     augmented_data = []
 
-    # 将策略向量变回二维，方便操作
-    policy_2d = policy.reshape(board_size, board_size)
+    # 循环4次旋转
+    for i in range(4):
+        # 旋转 state 和 policy
+        # np.rot90 会创建新的数组副本，是安全的
+        rotated_state = np.rot90(state_np, i, axes=(1, 2))
+        rotated_policy = np.rot90(policy_np, i)
 
-    # 8种对称变换
-    for i in range(1, 5):  # 旋转 0, 90, 180, 270 度
+        # 1. 添加旋转后的版本
+        augmented_data.append((rotated_state.copy(), rotated_policy.flatten()))
 
-        # 变换 State
-        augmented_state = np.rot90(state, i, axes=(1, 2))
-        # 变换 Policy
-        augmented_policy_2d = np.rot90(policy_2d, i)
-
-        # 原始旋转版本
-        augmented_data.append((augmented_state.copy(), augmented_policy_2d.flatten()))
-
-        # 水平翻转后再旋转的版本
-        flipped_state = np.flip(augmented_state, axis=2)
-        flipped_policy_2d = np.flip(augmented_policy_2d, axis=1)
-        augmented_data.append((flipped_state.copy(), flipped_policy_2d.flatten()))
+        # 2. 添加旋转后再水平翻转的版本
+        flipped_state = np.flip(rotated_state, axis=2)
+        flipped_policy = np.flip(rotated_policy, axis=1)
+        augmented_data.append((flipped_state.copy(), flipped_policy.flatten()))
 
     return augmented_data
 
@@ -149,6 +149,7 @@ def find_latest_model_file():
                 }
     return latest_file_info
 
+
 # ====================== Coach 类 (已更新 learn 方法) ======================
 
 
@@ -165,47 +166,48 @@ class Coach:
         self.model.train()
         if len(self.training_data) < self.args['batch_size']: return
         batch = random.sample(self.training_data, self.args['batch_size'])
-        # ==================== 新增诊断日志 开始 ====================
-        # 为了避免刷屏，我们只检查批次中的第一个样本
+        # file: coach.py, in train()
+        # ==================== 全新的、更详细的诊断日志 ====================
         if batch:
-            print("\n[DEBUG Coach] Inspecting a sample from the training batch:")
+            print("\n[DEBUG Coach] Inspecting a RAW sample from C++ training data:")
+            # 从训练批次中取出一个未经任何处理的原始样本
             _sample_state, sample_policy, sample_value = batch[0]
 
-            # 检查策略向量中是否有非零值
-            # np.any() 会在找到任何一个非零元素时返回 True
-            if np.any(sample_policy):
-                print(f"  - Policy looks OK. Max probability: {np.max(sample_policy):.4f}")
-            else:
-                # 如果策略向量所有值都是0，这是一个非常危险的信号
-                print("  - CRITICAL WARNING: Policy vector is all zeros!")
+            # 将其转换为Numpy数组以进行详细分析
+            policy_array = np.array(sample_policy)
 
-            print(f"  - Value: {sample_value:.4f}")
-        # ==================== 新增诊断日志 结束 ====================
+            # 打印策略向量的关键指标
+            print(f"  - Policy Vector Sum: {np.sum(policy_array)}")
+            print(f"  - Policy Vector Length: {len(sample_policy)}")
+            print(f"  - Policy Vector Max Value: {np.max(policy_array):.6f}")
+            print(f"  - Policy Vector Min Value: {np.min(policy_array):.6f}")
+
+            # 检查是否存在非数值（NaN）或无穷大（inf）
+            has_nan = np.isnan(policy_array).any()
+            has_inf = np.isinf(policy_array).any()
+            print(f"  - Contains NaN: {has_nan}")
+            print(f"  - Contains Inf: {has_inf}")
+
+            # 打印一部分策略值，以便我们直观感受
+            print(f"  - Policy Vector (first 10 elements): {policy_array[:10]}")
+
+            print(f"  - Value from C++: {sample_value:.4f}")
+        # ==================== 诊断日志结束 ====================
         # ==================== 数据增强核心逻辑 ====================
         augmented_batch = []
         for state, policy, value in batch:
-            state_reshaped = np.array(state).reshape(self.args['num_channels'], self.args['board_size'],
-                                                     self.args['board_size'])
-            policy_reshaped = np.array(policy).reshape(self.args['board_size'], self.args['board_size'])
+            # 调用独立的、健壮的增强函数
+            augmented_samples = get_augmented_data(state, policy, self.args['board_size'], self.args['num_channels'])
+            for aug_s, aug_p in augmented_samples:
+                augmented_batch.append((aug_s, aug_p, value))
 
-            # 循环应用8种对称变换
-            for i in range(1, 5):  # 旋转 0, 90, 180, 270 度
-                # 旋转
-                aug_state_rot = np.rot90(state_reshaped, i, axes=(1, 2))
-                aug_policy_rot = np.rot90(policy_reshaped, i)
-                augmented_batch.append((aug_state_rot.flatten(), aug_policy_rot.flatten(), value))
-
-                # 旋转后再水平翻转
-                aug_state_flipped = np.flip(aug_state_rot, axis=2)
-                aug_policy_flipped = np.flip(aug_policy_rot, axis=1)
-                augmented_batch.append((aug_state_flipped.flatten(), aug_policy_flipped.flatten(), value))
-        # ========================================================
-        # 使用增强后的数据进行训练
+        # 2. 准备用于训练的张量
+        # 注意：增强后的 state 已经是 numpy 数组，无需再 flatten
         states, target_policies, target_values = zip(*augmented_batch)
+
         states = torch.tensor(np.array(states), dtype=torch.float32).to(device)
         target_policies = torch.tensor(np.array(target_policies), dtype=torch.float32).to(device)
         target_values = torch.tensor(np.array(target_values), dtype=torch.float32).unsqueeze(1).to(device)
-        states = states.view(-1, self.args['num_channels'], self.args['board_size'], self.args['board_size'])
         self.optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
             pred_log_policies, pred_values = self.model(states)
@@ -222,7 +224,7 @@ class Coach:
         for i in range(start_epoch, start_epoch + self.args['num_iterations']):
             print(f"------ 迭代轮次: {i} ------")
 
-            print("步骤1：启动纯C++引擎进行自我对弈 (此过程将阻塞)...")
+            print("步骤1：启动纯C++引擎进行自我对弈...")
             final_data_queue = queue.Queue()
 
             cpp_args = {k: v for k, v in self.args.items()}
@@ -359,10 +361,16 @@ class Coach:
             'board_size': self.args['board_size'],
             'num_rounds': self.args['num_rounds'],
             'history_steps': self.args['history_steps'],
-            'num_channels': self.args['num_channels'], # C++端也需要通道数
+            'num_channels': self.args['num_channels'],  # C++端也需要通道数
 
             'enable_territory_heuristic': self.args.get('enable_territory_heuristic', False),
             'territory_heuristic_weight': self.args.get('territory_heuristic_weight', 0.0),
+
+            'enable_territory_penalty': self.args.get('enable_territory_penalty', False),
+            'territory_penalty_strength': self.args.get('territory_penalty_strength', 0.0),
+
+            'enable_ineffective_connection_penalty': self.args.get('enable_ineffective_connection_penalty', False),
+            'ineffective_connection_penalty_factor': self.args.get('ineffective_connection_penalty_factor', 0.1),
         }
 
         # --- 实验一：新模型执先手 (Model 2) ---

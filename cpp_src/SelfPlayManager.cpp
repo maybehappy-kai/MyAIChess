@@ -262,57 +262,58 @@ void apply_territory_penalty(
     }
 }
 
-// ====================== 新增：活二威胁检测启发函数 ======================
-void apply_threat_detection_bias(
-    std::vector<float> &policy,
-    const Gomoku &game_state,
-    float bonus_strength)
+// ====================== 新增：无效连接惩罚函数 ======================
+void apply_ineffective_connection_penalty(
+    std::vector<float>& policy,
+    const Gomoku& game_state,
+    float penalty_factor)
 {
     const int board_size = game_state.get_board_size();
-    const int player = game_state.get_current_player();
     auto valid_moves = game_state.get_valid_moves();
+    const int current_player_id = game_state.get_current_player();
 
-    std::vector<int> threat_moves;
+    // 1. 获取当前玩家在落子前的领地分数
+    auto scores_before = game_state.calculate_scores();
+    int player_score_before = scores_before.at(current_player_id);
 
+    // 2. 遍历所有可能的合法走法
     for (int action = 0; action < board_size * board_size; ++action)
     {
-        if (!valid_moves[action])
-            continue;
-
-        Gomoku next_state = game_state;
-        next_state.execute_move(action);
-
-        // 在新状态下，检查对手是否已经输了 (因为我们的落子可能直接形成三连)
-        // 这个检查很简单，如果对手没有合法落子点，说明我们赢了
-        if (std::none_of(next_state.get_valid_moves().begin(), next_state.get_valid_moves().end(), [](bool v)
-                         { return v; }))
+        // 只检查有一定概率的合法走法，避免无效计算
+        if (valid_moves[action] && policy[action] > 1e-6)
         {
-            threat_moves.push_back(action);
-            continue;
+            // 3. 在一个临时副本上模拟落子
+            Gomoku next_state = game_state;
+            next_state.execute_move(action);
+
+            // 4. 检查是否发生了“自提”：我们刚下的棋子是否消失了？
+            int r = action / board_size;
+            int c = action % board_size;
+            if (!next_state.is_occupied(r, c))
+            {
+                // 5. 如果发生自提，计算领地收益
+                auto scores_after = next_state.calculate_scores();
+                // 注意：execute_move后玩家会切换，但我们仍要计算原玩家的分数
+                int player_score_after = scores_after.at(current_player_id);
+                int territory_gain = player_score_after - player_score_before;
+
+                // 6. 如果没有任何领地收益，则施加惩罚
+                if (territory_gain <= 0)
+                {
+                    policy[action] *= penalty_factor;
+                }
+            }
         }
     }
 
-    if (!threat_moves.empty())
-    {
-        float total_policy = 0.0f;
-        // 给所有识别出的威胁点加上巨大的奖励
-        for (int move : threat_moves)
-        {
-            policy[move] += bonus_strength;
-        }
-        // 重新归一化
-        for (float p : policy)
-        {
-            if (p > 0)
-                total_policy += p;
-        }
-        if (total_policy > 0)
-        {
-            for (float &p : policy)
-            {
-                if (p > 0)
-                    p /= total_policy;
-            }
+    // 7. 重新归一化策略，确保总和为1
+    float policy_sum = 0.0f;
+    for (float p : policy) {
+        if (p > 0) policy_sum += p;
+    }
+    if (policy_sum > 0.0f) {
+        for (float& p : policy) {
+            if (p > 0) p /= policy_sum;
         }
     }
 }
@@ -442,11 +443,6 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
                             }
                         }
                     }
-                    // 威胁检测
-                    if (config.enable_threat_detection)
-                    {
-                        apply_threat_detection_bias(current_policy, leaf_state_for_expansion, config.threat_detection_bonus);
-                    }
                     // 狄利克雷噪声
                     add_dirichlet_noise(current_policy, leaf_state_for_expansion.get_valid_moves(),
                                         config.dirichlet_alpha, config.dirichlet_epsilon);
@@ -457,6 +453,12 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
                 if (config.enable_territory_penalty) {
                     apply_territory_penalty(current_policy, leaf_state_for_expansion, config.territory_penalty_strength);
                 }
+
+                // ★★★ 新增调用点：在这里应用新的惩罚函数 ★★★
+                            // 这个位置确保了它在训练、评估、对战时都生效
+                            if (config.enable_ineffective_connection_penalty) {
+                                apply_ineffective_connection_penalty(current_policy, leaf_state_for_expansion, config.ineffective_connection_penalty_factor);
+                            }
             }
 
             // --- 通用逻辑区 ---
@@ -628,8 +630,8 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
     this->mcts_config_.num_channels = args["num_channels"].cast<int>();
     this->mcts_config_.enable_opening_bias = args["enable_opening_bias"].cast<bool>();
     this->mcts_config_.opening_bias_strength = args["opening_bias_strength"].cast<float>();
-    this->mcts_config_.enable_threat_detection = args["enable_threat_detection"].cast<bool>();
-    this->mcts_config_.threat_detection_bonus = args["threat_detection_bonus"].cast<float>();
+    this->mcts_config_.enable_ineffective_connection_penalty = args["enable_ineffective_connection_penalty"].cast<bool>();
+    this->mcts_config_.ineffective_connection_penalty_factor = args["ineffective_connection_penalty_factor"].cast<float>();
     this->mcts_config_.enable_territory_heuristic = args["enable_territory_heuristic"].cast<bool>();
     this->mcts_config_.territory_heuristic_weight = args["territory_heuristic_weight"].cast<double>();
     this->mcts_config_.dirichlet_alpha = args["dirichlet_alpha"].cast<double>();
@@ -867,8 +869,8 @@ EvaluationManager::EvaluationManager(
     // 评估模式下，以下参数不起作用，但为保持结构完整性，我们仍进行初始化
     this->mcts_config_.enable_opening_bias = false;
     this->mcts_config_.opening_bias_strength = 0.0f;
-    this->mcts_config_.enable_threat_detection = false;
-    this->mcts_config_.threat_detection_bonus = 0.0f;
+    this->mcts_config_.enable_ineffective_connection_penalty = args.contains("enable_ineffective_connection_penalty") ? args["enable_ineffective_connection_penalty"].cast<bool>() : false;
+    this->mcts_config_.ineffective_connection_penalty_factor = args.contains("ineffective_connection_penalty_factor") ? args["ineffective_connection_penalty_factor"].cast<float>() : 0.0f;
     // 从Python的args字典中动态读取领地启发参数
     this->mcts_config_.enable_territory_heuristic = args.contains("enable_territory_heuristic") ? args["enable_territory_heuristic"].cast<bool>() : false;
     this->mcts_config_.territory_heuristic_weight = args.contains("territory_heuristic_weight") ? args["territory_heuristic_weight"].cast<double>() : 0.0;
@@ -1078,8 +1080,8 @@ int find_best_action_for_state(
     // 在评估/对战模式下，其他启发式参数设为默认关闭状态
     config.enable_opening_bias = false;
     config.opening_bias_strength = 0.0f;
-    config.enable_threat_detection = false;
-    config.threat_detection_bonus = 0.0f;
+    config.enable_ineffective_connection_penalty = args.contains("enable_ineffective_connection_penalty") ? args["enable_ineffective_connection_penalty"].cast<bool>() : false;
+    config.ineffective_connection_penalty_factor = args.contains("ineffective_connection_penalty_factor") ? args["ineffective_connection_penalty_factor"].cast<float>() : 0.0f;
     // 从Python的args字典中动态读取领地启发参数
     config.enable_territory_heuristic = args.contains("enable_territory_heuristic") ? args["enable_territory_heuristic"].cast<bool>() : false;
     config.territory_heuristic_weight = args.contains("territory_heuristic_weight") ? args["territory_heuristic_weight"].cast<double>() : 0.0;
