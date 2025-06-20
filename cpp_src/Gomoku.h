@@ -55,6 +55,8 @@ public:
     int get_move_number() const;
     int get_territory_score() const;
     BitboardState get_bitboard_state() const;
+    const uint64_t* get_player_stones_bitboard() const;
+    const uint64_t* get_player_territory_bitboard() const;
 
     // 调试与辅助函数
     void print_board() const;

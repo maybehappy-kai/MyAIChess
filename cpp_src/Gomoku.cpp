@@ -426,3 +426,11 @@ void Gomoku::print_board() const {
         std::cout << std::endl;
     }
 }
+
+const uint64_t* Gomoku::get_player_stones_bitboard() const {
+    return (current_player_ == PLAYER_BLACK) ? black_stones_ : white_stones_;
+}
+
+const uint64_t* Gomoku::get_player_territory_bitboard() const {
+    return (current_player_ == PLAYER_BLACK) ? black_territory_ : white_territory_;
+}

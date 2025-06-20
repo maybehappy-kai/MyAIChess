@@ -31,6 +31,8 @@ struct MCTS_Config {
     double temperature_start;
     double temperature_end;
     int temperature_decay_moves;
+    bool enable_territory_penalty;
+    float territory_penalty_strength;
 };
 // =================================================================
 

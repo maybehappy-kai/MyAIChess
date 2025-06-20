@@ -22,6 +22,16 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(const Gomoku&, const
 #include <algorithm>
 #include <atomic>
 
+// vvvvvv 在此处粘贴以下代码块 vvvvvv
+// 为了兼容性，定义popcount
+#ifdef _MSC_VER
+#include <intrin.h>
+#define popcount __popcnt64
+#else
+#define popcount __builtin_popcountll
+#endif
+// ^^^^^^ 在此处粘贴以上代码块 ^^^^^^
+
 // ======================= 新增的、仅供人机对战使用的引擎缓存 =======================
 // 用于存储已经加载的模型，避免在对战中重复从硬盘读取
 static std::mutex g_engine_mutex;
@@ -181,6 +191,45 @@ void add_dirichlet_noise(
 }
 // ===========================================================================
 
+// file: cpp_src/SelfPlayManager.cpp
+
+// ====================== 领地内落子惩罚函数 (最终版) ======================
+void apply_territory_penalty(
+    std::vector<float>& policy,
+    const Gomoku& game_state,
+    float penalty_strength)
+{
+    // 获取当前玩家的领地位棋盘
+    const uint64_t* player_territory = game_state.get_player_territory_bitboard();
+    const int board_size = game_state.get_board_size();
+
+    // 遍历棋盘上的每一个点
+    for (int action = 0; action < board_size * board_size; ++action) {
+        const int index = action / 64;
+        const uint64_t mask = 1ULL << (action % 64);
+
+        // 检查这个点是否已经是当前玩家的领地
+        if ((player_territory[index] & mask) != 0) {
+            // 如果是，直接将此处的策略概率乘以一个惩罚系数
+            // penalty_strength=0.5 意味着将此处的概率减半
+            // penalty_strength=1.0 意味着将此处概率降为0
+            policy[action] *= (1.0f - penalty_strength);
+        }
+    }
+
+    // 重新归一化策略概率，确保总和为1
+    float policy_sum = 0.0f;
+    for (float p : policy) {
+        // 确保不加负数
+        if (p > 0) policy_sum += p;
+    }
+    if (policy_sum > 0.0f) {
+        for (float& p : policy) {
+            if (p > 0) p /= policy_sum;
+        }
+    }
+}
+
 // ====================== 新增：活二威胁检测启发函数 ======================
 void apply_threat_detection_bias(
     std::vector<float> &policy,
@@ -315,54 +364,70 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
         }
         auto [policy_batch, value_batch] = engine.infer(state_batch, root_state.get_board_size(), config.num_channels);
 
-        // ================== 1c. 扩展和反向传播 (核心修正区域) ==================
+        // ================== 1c. 扩展和反向传播 (结构优化版) ==================
         for (size_t k = 0; k < leaves_batch.size(); ++k)
         {
-            Node *leaf = leaves_batch[k];
+            Node* leaf = leaves_batch[k];
             auto current_policy = policy_batch[k];
+            double nn_value = static_cast<double>(value_batch[k]);
             Gomoku leaf_state_for_expansion = reconstruct_game_state(leaf, root_state);
 
-            // 【修正点 1】: 将特殊逻辑(噪声/启发)与通用逻辑(扩展/回传)分离
-            // 特殊逻辑只对根节点生效
-            if (mode == MCTS_MODE::SELF_PLAY && leaf->parent_ == nullptr)
+            // --- 根节点专属逻辑区 ---
+            // 所有只在根节点应用的启发式策略都集中于此
+            if (leaf == root.get())
             {
-                if (config.enable_opening_bias && leaf_state_for_expansion.get_move_number() < 50)
+                // Part 1: 仅在“训练(自对弈)”模式下生效的探索性策略
+                if (mode == MCTS_MODE::SELF_PLAY)
                 {
-                    // ... (开局偏置代码保持不变) ...
-                    const int board_size = leaf_state_for_expansion.get_board_size();
-                    float bias_strength = config.opening_bias_strength;
-                    std::vector<float> opening_bias(board_size * board_size, 0.0f);
-                    for (int r = 0; r < board_size; ++r) {
-                        for (int c = 0; c < board_size; ++c) {
-                            int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
-                            float bias = 0.0f;
-                            if (dist_from_edge == 0) bias = 0.1f;
-                            else if (dist_from_edge == 1) bias = 0.4f;
-                            else if (dist_from_edge == 2) bias = 0.8f;
-                            else bias = 1.0f;
-                            opening_bias[r * board_size + c] = bias;
+                    // 开局偏置
+                    if (config.enable_opening_bias && leaf_state_for_expansion.get_move_number() < 50)
+                    {
+                        const int board_size = leaf_state_for_expansion.get_board_size();
+                        float bias_strength = config.opening_bias_strength;
+                        std::vector<float> opening_bias(board_size * board_size, 0.0f);
+                        for (int r = 0; r < board_size; ++r) {
+                            for (int c = 0; c < board_size; ++c) {
+                                int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
+                                float bias = 0.0f;
+                                if (dist_from_edge == 0) bias = 0.1f;
+                                else if (dist_from_edge == 1) bias = 0.4f;
+                                else if (dist_from_edge == 2) bias = 0.8f;
+                                else bias = 1.0f;
+                                opening_bias[r * board_size + c] = bias;
+                            }
                         }
-                    }
-                    float policy_sum = 0.0f;
-                    for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i) {
-                        current_policy[pol_i] += bias_strength * opening_bias[pol_i];
-                        policy_sum += current_policy[pol_i];
-                    }
-                    if (policy_sum > 0.0f) {
+                        float policy_sum = 0.0f;
                         for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i) {
-                            current_policy[pol_i] /= policy_sum;
+                            current_policy[pol_i] += bias_strength * opening_bias[pol_i];
+                            policy_sum += current_policy[pol_i];
+                        }
+                        if (policy_sum > 0.0f) {
+                            for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i) {
+                                current_policy[pol_i] /= policy_sum;
+                            }
                         }
                     }
+                    // 威胁检测
+                    if (config.enable_threat_detection)
+                    {
+                        apply_threat_detection_bias(current_policy, leaf_state_for_expansion, config.threat_detection_bonus);
+                    }
+                    // 狄利克雷噪声
+                    add_dirichlet_noise(current_policy, leaf_state_for_expansion.get_valid_moves(),
+                                        config.dirichlet_alpha, config.dirichlet_epsilon);
                 }
-                if (config.enable_threat_detection)
-                {
-                    apply_threat_detection_bias(current_policy, leaf_state_for_expansion, config.threat_detection_bonus);
+
+                // Part 2: 在“所有模式”下对根节点生效的策略惩罚
+                // (新位置) 领地维持惩罚
+                if (config.enable_territory_penalty) {
+                    apply_territory_penalty(current_policy, leaf_state_for_expansion, config.territory_penalty_strength);
                 }
-                add_dirichlet_noise(current_policy, leaf_state_for_expansion.get_valid_moves(),
-                                    config.dirichlet_alpha, config.dirichlet_epsilon);
             }
 
-            // 【修正点 2】: 扩展逻辑对所有叶子节点生效
+            // --- 通用逻辑区 ---
+            // 以下逻辑对所有叶子节点（包括根节点）生效
+
+            // 步骤 1: 扩展子节点
             const auto valid_moves = leaf_state_for_expansion.get_valid_moves();
             for (size_t action = 0; action < current_policy.size(); ++action)
             {
@@ -381,22 +446,17 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
                 }
             }
 
-            // 【修正点 3】: 价值计算与反向传播逻辑对所有叶子节点生效
-            double nn_value = static_cast<double>(value_batch[k]);
-            double final_value = nn_value;
-            if (config.enable_territory_heuristic)
+            // 步骤 2: 计算最终价值并反向传播
+            double final_value = nn_value; // 默认最终价值等于神经网络的输出
+
+            // (新位置) 仅在根节点处，用领地启发来修正价值
+            if (leaf == root.get() && config.enable_territory_heuristic)
             {
                 double territory_score = static_cast<double>(leaf_state_for_expansion.get_territory_score());
                 double heuristic_value = territory_score / (root_state.get_board_size() * root_state.get_board_size());
                 final_value = (1.0 - config.territory_heuristic_weight) * nn_value + config.territory_heuristic_weight * heuristic_value;
             }
 
-            // 注意：反向传播时，要偿还之前加上的虚拟损失
-            /*Node *temp_node = leaf;
-            while (temp_node != nullptr) {
-                temp_node->virtual_loss_count_--;
-                temp_node = temp_node->parent_;
-            }*/
             leaf->backpropagate(final_value);
         }
     } // ================== MCTS 主循环结束 ==================
@@ -542,6 +602,8 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
     this->mcts_config_.temperature_start = args["temperature_start"].cast<double>();
     this->mcts_config_.temperature_end = args["temperature_end"].cast<double>();
     this->mcts_config_.temperature_decay_moves = args["temperature_decay_moves"].cast<int>();
+    this->mcts_config_.enable_territory_penalty = args.contains("enable_territory_penalty") ? args["enable_territory_penalty"].cast<bool>() : false;
+    this->mcts_config_.territory_penalty_strength = args.contains("territory_penalty_strength") ? args["territory_penalty_strength"].cast<float>() : 0.0f;
 }
 // file: cpp_src/SelfPlayManager.cpp
 // 找到 SelfPlayManager::collector_func 函数，并用下面的完整版本替换它
@@ -764,6 +826,8 @@ EvaluationManager::EvaluationManager(
     this->mcts_config_.mcts_batch_size = args["mcts_batch_size"].cast<int>();
     this->mcts_config_.history_steps = args["history_steps"].cast<int>();
     this->mcts_config_.num_channels = args["num_channels"].cast<int>();
+    this->mcts_config_.enable_territory_penalty = args.contains("enable_territory_penalty") ? args["enable_territory_penalty"].cast<bool>() : false;
+    this->mcts_config_.territory_penalty_strength = args.contains("territory_penalty_strength") ? args["territory_penalty_strength"].cast<float>() : 0.0f;
 
     // 评估模式下，以下参数不起作用，但为保持结构完整性，我们仍进行初始化
     this->mcts_config_.enable_opening_bias = false;
@@ -825,32 +889,27 @@ void EvaluationManager::worker_func(int worker_id)
 
         try
         {
+            // ... 在 EvaluationManager::worker_func 的 try 块内部 ...
+
             Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
-            std::deque<BitboardState> game_history; // <-- 同样需要历史记录deque
+            std::deque<BitboardState> game_history;
 
-            // ... (选择p1_engine和p2_engine的逻辑保持不变) ...
-            auto &p1_engine = engine1_;
-            auto &p2_engine = engine2_;
-            if (evaluation_mode_ == 0 && (game_idx % 2 != 0))
-            { // Mode 0: 交替先后手
+            // vvvvvv 【全新的、更简洁的修正逻辑】 vvvvvv
+            std::shared_ptr<InferenceEngine> p1_engine, p2_engine;
 
-                bool swap_models = (game_idx % 2 != 0);
+            // mode 1: model1(旧) 先手 --> (p1=eng1, p2=eng2)
+            // mode 2: model2(新) 先手 --> (p1=eng2, p2=eng1)
+            // mode 0: 交替先后手
+            bool swap_models = (evaluation_mode_ == 2) || (evaluation_mode_ == 0 && game_idx % 2 != 0);
 
-                if (swap_models)
-                {
-
-                    p1_engine = engine2_;
-
-                    p2_engine = engine1_;
-                }
+            if (swap_models) {
+                p1_engine = engine2_; // 新模型执黑 (P1)
+                p2_engine = engine1_; // 旧模型执白 (P2)
+            } else {
+                p1_engine = engine1_; // 旧模型执黑 (P1)
+                p2_engine = engine2_; // 新模型执白 (P2)
             }
-            else if (evaluation_mode_ == 2)
-            { // Mode 2: 固定 Model 2 先手
-
-                p1_engine = engine2_;
-
-                p2_engine = engine1_;
-            }
+            // ^^^^^^ 【全新的、更简洁的修正逻辑】 ^^^^^^
 
             std::map<int, std::shared_ptr<InferenceEngine>> models = {
                 {1, p1_engine}, {-1, p2_engine}};
@@ -881,14 +940,15 @@ void EvaluationManager::worker_func(int worker_id)
                 }
                 game.execute_move(action);
 
+                if (worker_id == 0)
                 {
-                        std::lock_guard<std::mutex> lock(g_io_mutex); // 使用全局锁确保打印不混乱
-                        std::cout << "\n=======================================================\n";
-                        std::cout << "[Eval Game " << game_idx << ", Worker " << worker_id << "] Move #" << game.get_move_number() << "\n";
-                        std::cout << "Player " << game.get_current_player() * -1 << " (Engine: " << ((current_engine == engine1_) ? "Model1-Old" : "Model2-New") << ") chose action: " << action << "\n";
-                        game.print_board();
-                        std::cout << "=======================================================\n";
-                    }
+                    std::lock_guard<std::mutex> lock(g_io_mutex);
+                    std::cout << "\n=======================================================\n";
+                    std::cout << "[Eval Game " << game_idx << ", Worker " << worker_id << "] Move #" << game.get_move_number() << "\n";
+                    std::cout << "Player " << game.get_current_player() * -1 << " (Engine: " << ((current_engine == engine1_) ? "Model1-Old" : "Model2-New") << ") chose action: " << action << "\n";
+                    game.print_board();
+                    std::cout << "=======================================================\n";
+                }
 
                 auto [final_value, is_done] = game.get_game_ended();
                 if (is_done)
@@ -988,6 +1048,8 @@ int find_best_action_for_state(
     // 从Python的args字典中动态读取领地启发参数
     config.enable_territory_heuristic = args.contains("enable_territory_heuristic") ? args["enable_territory_heuristic"].cast<bool>() : false;
     config.territory_heuristic_weight = args.contains("territory_heuristic_weight") ? args["territory_heuristic_weight"].cast<double>() : 0.0;
+    config.enable_territory_penalty = args.contains("enable_territory_penalty") ? args["enable_territory_penalty"].cast<bool>() : false;
+    config.territory_penalty_strength = args.contains("territory_penalty_strength") ? args["territory_penalty_strength"].cast<float>() : 0.0f;
     config.dirichlet_alpha = 0.0;
     config.dirichlet_epsilon = 0.0;
     config.temperature_start = 0.0;

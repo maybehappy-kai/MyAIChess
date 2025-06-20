@@ -14,7 +14,7 @@ args = {
     'num_hidden': 128,
     'dirichlet_alpha': 0.3,
     'dirichlet_epsilon': 0.25,
-    'value_loss_weight': 0.25,
+    'value_loss_weight': 1,
 
     # 温度采样参数
     'temperature_start': 1.0,
@@ -43,7 +43,11 @@ args = {
 
     # 领地价值启发参数
     'enable_territory_heuristic': True,  # [之前缺失] True 表示启用领地启发
-    'territory_heuristic_weight': 0.3,  # 领地启发所占的权重
+    'territory_heuristic_weight': 0.6,  # 领地启发所占的权重
+
+    # 领地维持惩罚参数 (新功能)
+    'enable_territory_penalty': True,      # True 表示启用该惩罚
+    'territory_penalty_strength': 0.5,   # 惩罚强度(一个负向的偏置)
     # =======================================================
-    'history_steps': 4, # 记录T-1, T-2, T-3三步历史
+    'history_steps': 3, # 记录T-1, T-2, T-3三步历史
 }
