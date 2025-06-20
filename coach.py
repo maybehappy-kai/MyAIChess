@@ -359,7 +359,10 @@ class Coach:
             'board_size': self.args['board_size'],
             'num_rounds': self.args['num_rounds'],
             'history_steps': self.args['history_steps'],
-            'num_channels': self.args['num_channels']  # C++端也需要通道数
+            'num_channels': self.args['num_channels'], # C++端也需要通道数
+
+            'enable_territory_heuristic': self.args.get('enable_territory_heuristic', False),
+            'territory_heuristic_weight': self.args.get('territory_heuristic_weight', 0.0),
         }
 
         # --- 实验一：新模型执先手 (Model 2) ---

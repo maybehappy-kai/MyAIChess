@@ -8,6 +8,11 @@
 #include "Node.h"
 #include "SafeQueue.h"
 #include "Arena.h"
+
+struct MCTS_Config; // 先声明MCTS_Config结构体
+enum class MCTS_MODE;  // 再声明MCTS_MODE枚举
+std::pair<int, std::vector<float>> find_best_action_by_mcts(const Gomoku&, const std::deque<BitboardState>&, InferenceEngine&, const MCTS_Config&, MCTS_MODE);
+
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -379,7 +384,7 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
             // 【修正点 3】: 价值计算与反向传播逻辑对所有叶子节点生效
             double nn_value = static_cast<double>(value_batch[k]);
             double final_value = nn_value;
-            if (mode == MCTS_MODE::SELF_PLAY && config.enable_territory_heuristic)
+            if (config.enable_territory_heuristic)
             {
                 double territory_score = static_cast<double>(leaf_state_for_expansion.get_territory_score());
                 double heuristic_value = territory_score / (root_state.get_board_size() * root_state.get_board_size());
@@ -640,7 +645,9 @@ void SelfPlayManager::run()
     }
 }
 
-// ====================== 最终版工作函数 (包含正确的MCTS和所有原有功能) ======================
+// 文件: cpp_src/SelfPlayManager.cpp
+// 这是包含了您指出的 action_size 初始化代码的最终修正版
+
 void SelfPlayManager::worker_func(int worker_id)
 {
     while (true)
@@ -656,58 +663,48 @@ void SelfPlayManager::worker_func(int worker_id)
             Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
             std::deque<BitboardState> game_history;
             std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
+
+            // 【已加回】根据您的反馈，保留 action_size 的初始化
             const int action_size = game.get_board_size() * game.get_board_size();
 
-            // ====================== 单局游戏主循环 ======================
             while (true)
             {
-                const Gomoku root_state(game);
-                // ==================== 调用统一的MCTS核心 ====================
-
-                // 在 SelfPlayManager::worker_func 中
-                // ...
-                // 2. 调用核心函数，获取动作和策略
-                auto [action, action_probs] = find_best_action_by_mcts(
-                    root_state,
-                    game_history,
-                    *engine_,
-                    this->mcts_config_, // <-- 直接传递配置成员，干净利落！
-                    MCTS_MODE::SELF_PLAY);
-                // ==========================================================
-                episode_data.emplace_back(root_state.get_state(game_history), action_probs, game.get_current_player());
-
-                game_history.push_front(game.get_bitboard_state());
-                // 如果历史记录超过了所需长度，则从末尾丢弃最旧的记录
-                if (game_history.size() > static_cast<size_t>(this->mcts_config_.history_steps))
-                {
-                    game_history.pop_back();
-                }
-
-                // === 4. 执行动作并为下一轮做准备 ===
-                game.execute_move(action);
-
-                // 游戏结束判断与数据处理
+                // 1. 【先判断】游戏是否结束
                 auto [final_value, is_done] = game.get_game_ended();
                 if (is_done)
                 {
-                    // ==================== 修改数据提交流程 开始 ====================
-                    TrainingDataPacket cpp_training_examples; // 使用我们定义的新类型
+                    // 如果结束，整理并提交本局所有数据，然后跳出循环
+                    TrainingDataPacket cpp_training_examples;
                     cpp_training_examples.reserve(episode_data.size());
                     for (const auto &example : episode_data)
                     {
                         double corrected_value = final_value * std::get<2>(example);
                         cpp_training_examples.emplace_back(std::get<0>(example), std::get<1>(example), corrected_value);
                     }
-
-                    // 不再获取GIL，而是直接将C++数据包推入C++中转队列
                     data_collector_queue_.push(std::move(cpp_training_examples));
-
-                    // 原子地增加已完成游戏计数
                     completed_games_count_++;
-
-                    // ==================== 修改数据提交流程 结束 ====================
-                    break;
+                    break; // 结束本局游戏
                 }
+
+                // 2. 【后执行】如果游戏未结束，才为当前状态寻找最佳动作
+                const Gomoku root_state(game);
+                auto [action, action_probs] = find_best_action_by_mcts(
+                    root_state,
+                    game_history,
+                    *engine_,
+                    this->mcts_config_,
+                    MCTS_MODE::SELF_PLAY);
+
+                // 3. 存储【有效】的训练数据
+                episode_data.emplace_back(root_state.get_state(game_history), action_probs, game.get_current_player());
+
+                // 4. 更新历史记录并执行动作
+                game_history.push_front(game.get_bitboard_state());
+                if (game_history.size() > static_cast<size_t>(this->mcts_config_.history_steps))
+                {
+                    game_history.pop_back();
+                }
+                game.execute_move(action);
             }
         }
         catch (const std::exception &e)
@@ -773,8 +770,9 @@ EvaluationManager::EvaluationManager(
     this->mcts_config_.opening_bias_strength = 0.0f;
     this->mcts_config_.enable_threat_detection = false;
     this->mcts_config_.threat_detection_bonus = 0.0f;
-    this->mcts_config_.enable_territory_heuristic = false;
-    this->mcts_config_.territory_heuristic_weight = 0.0;
+    // 从Python的args字典中动态读取领地启发参数
+    this->mcts_config_.enable_territory_heuristic = args.contains("enable_territory_heuristic") ? args["enable_territory_heuristic"].cast<bool>() : false;
+    this->mcts_config_.territory_heuristic_weight = args.contains("territory_heuristic_weight") ? args["territory_heuristic_weight"].cast<double>() : 0.0;
     this->mcts_config_.dirichlet_alpha = 0.0;
     this->mcts_config_.dirichlet_epsilon = 0.0;
     this->mcts_config_.temperature_start = 0.0;
@@ -952,6 +950,9 @@ void EvaluationManager::worker_func(int worker_id)
     }
 }
 
+// file: cpp_src/SelfPlayManager.cpp
+// 用这个【最终、完全修正版】的函数，替换掉文件中旧的同名函数
+
 int find_best_action_for_state(
     py::list py_board_pieces,
     py::list py_board_territory,
@@ -961,32 +962,39 @@ int find_best_action_for_state(
     bool use_gpu,
     py::dict args)
 {
-    py::gil_scoped_release release; // 释放GIL，允许Python线程运行
-
-    // 1. 获取模型引擎 (这部分逻辑不变)
+    // 1. 获取模型引擎
     auto engine = get_cached_engine(model_path, use_gpu);
 
     // 2. 从Python传入的args字典，动态创建MCTS_Config结构体
     MCTS_Config config;
-    config.num_simulations = args["num_searches"].cast<int>(); // 人机对战用num_searches
+    config.num_simulations = args["num_searches"].cast<int>();
     config.c_puct = args["C"].cast<double>();
     config.mcts_batch_size = args["mcts_batch_size"].cast<int>();
     config.history_steps = args["history_steps"].cast<int>();
-    config.num_channels = args["num_channels"].cast<int>();
-    // 在评估/对战模式下，其他参数不起作用，设为默认值
+
+    // ====================== 【核心修正】 ======================
+    // 修正了通道数的计算逻辑，确保与Python训练时完全一致
+    int history_steps = args["history_steps"].cast<int>();
+    int state_channels = (history_steps + 1) * 4; // (历史步数 + 当前状态) * 4个平面
+    int meta_channels = 4; // 4个元数据平面
+    config.num_channels = state_channels + meta_channels; // 总通道数，(3+1)*4 + 4 = 20
+    // =========================================================
+
+    // 在评估/对战模式下，其他启发式参数设为默认关闭状态
     config.enable_opening_bias = false;
     config.opening_bias_strength = 0.0f;
     config.enable_threat_detection = false;
     config.threat_detection_bonus = 0.0f;
-    config.enable_territory_heuristic = false;
-    config.territory_heuristic_weight = 0.0;
+    // 从Python的args字典中动态读取领地启发参数
+    config.enable_territory_heuristic = args.contains("enable_territory_heuristic") ? args["enable_territory_heuristic"].cast<bool>() : false;
+    config.territory_heuristic_weight = args.contains("territory_heuristic_weight") ? args["territory_heuristic_weight"].cast<double>() : 0.0;
     config.dirichlet_alpha = 0.0;
     config.dirichlet_epsilon = 0.0;
     config.temperature_start = 0.0;
     config.temperature_end = 0.0;
     config.temperature_decay_moves = 0;
 
-    // 3. 从Python列表恢复Gomoku的根状态 (这部分逻辑不变)
+    // 3. 从Python列表恢复Gomoku的根状态
     int board_size = args["board_size"].cast<int>();
     int max_total_moves = args["max_total_moves"].cast<int>();
     uint64_t black_s[2] = {0, 0}, white_s[2] = {0, 0}, black_t[2] = {0, 0}, white_t[2] = {0, 0};
@@ -997,44 +1005,47 @@ int find_best_action_for_state(
         for (int c = 0; c < board_size; ++c)
         {
             int piece = row_p[c].cast<int>();
-            if (piece != 0)
-            {
+            if (piece != 0) {
                 int pos = r * board_size + c;
                 uint64_t mask = 1ULL << (pos % 64);
-                if (piece == 1)
-                    black_s[pos / 64] |= mask;
-                else
-                    white_s[pos / 64] |= mask;
+                if (piece == 1) black_s[pos / 64] |= mask; else white_s[pos / 64] |= mask;
             }
             int territory = row_t[c].cast<int>();
-            if (territory != 0)
-            {
+            if (territory != 0) {
                 int pos = r * board_size + c;
                 uint64_t mask = 1ULL << (pos % 64);
-                if (territory == 1)
-                    black_t[pos / 64] |= mask;
-                else
-                    white_t[pos / 64] |= mask;
+                if (territory == 1) black_t[pos / 64] |= mask; else white_t[pos / 64] |= mask;
             }
         }
     }
+
+    // 【修正】Gomoku的构造函数需要的是 num_rounds，而不是 max_total_moves
+    int num_rounds = max_total_moves / 2;
     Gomoku root_state(
-        board_size, max_total_moves, current_player, current_move_number,
-        black_s, white_s, black_t, white_t, config.history_steps);
-
-    // 4. 为人机对战创建一个空的history deque
-    // (因为play_pixel_art.py没有传递历史信息，这里我们做简化处理)
-    std::deque<BitboardState> history;
-
-    // 5. 调用统一的MCTS核心函数！
-    auto [action, policy] = find_best_action_by_mcts(
-        root_state,
-        history,
-        *engine,
-        config,
-        MCTS_MODE::EVALUATION // 人机对战使用确定性的评估模式
+        board_size, num_rounds,
+        current_player, current_move_number,
+        black_s, white_s, black_t, white_t, config.history_steps
     );
 
-    // 6. 返回最终动作
-    return action;
+    // 为人机对战创建一个空的history deque
+    std::deque<BitboardState> history;
+
+    int final_action = -1;
+    {
+        // 仅在进行纯C++的MCTS重度计算时，才释放GIL
+        py::gil_scoped_release release;
+
+        // 调用统一的MCTS核心函数
+        auto [best_action, policy] = find_best_action_by_mcts(
+            root_state,
+            history,
+            *engine,
+            config,
+            MCTS_MODE::EVALUATION
+        );
+        final_action = best_action;
+    }
+
+    // 返回最终动作
+    return final_action;
 }

@@ -220,6 +220,14 @@ class GameGUI:
         # 以确保人机对战的AI行为与训练时完全一致
         ai_args = args.copy()
 
+        # vvvvvv 【新增的修复代码】 vvvvvv
+        # 从 coach.py 复制过来的参数计算逻辑，确保C++引擎获得必要的num_channels
+        history_channels = (ai_args.get('history_steps', 0) + 1) * 4
+        meta_channels = 4
+        total_channels = history_channels + meta_channels
+        ai_args['num_channels'] = total_channels
+        # ^^^^^^ 【新增的修复代码】 ^^^^^^
+
         # 你可以根据需要覆盖特定参数，例如，在对战时减少搜索次数
         # ai_args['num_searches'] = 400 # 示例：如果想在对战时降低AI强度
 
