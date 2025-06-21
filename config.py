@@ -3,7 +3,7 @@
 args = {
     'C': 2,
     'num_searches': 800,
-    'num_iterations': 1,
+    'num_iterations': 10,
     'num_selfPlay_episodes': 100,
     'num_cpu_threads': 18,
     'training_steps_per_iteration': 1000, # 每次迭代训练1000个mini-batch

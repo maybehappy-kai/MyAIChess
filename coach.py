@@ -375,7 +375,7 @@ class Coach:
                     os.remove(candidate_model_path_pt)
 
                 # --- 步骤 5: 优胜劣汰 (修改后的逻辑) ---
-                if win_rate > 0.55:
+                if win_rate >= 0.55:
                     print(f"【模型晋升】候选 {candidate_idx + 1} 胜率达标，将其保存为 model_{i} 并设为新的最优模型。")
                     promotion_achieved_this_iteration = True
                     elo_best_model = new_elo_candidate  # <-- 新增此行，传递Elo
