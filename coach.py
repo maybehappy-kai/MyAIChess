@@ -182,36 +182,52 @@ class Coach:
         avg_value_loss = np.mean(value_losses) if value_losses else 0
         return avg_policy_loss, avg_value_loss
 
-    # ====================== 【核心改动 2】learn函数流程重构 ======================
-    def learn(self, start_epoch=1):
+    # file: coach.py
+    # 请用这个新版本的函数，完整替换掉文件中旧的 learn 函数
+
+    # file: coach.py
+    # 这是最终的、实现了“目标驱动”逻辑的 learn 函数，请用它替换旧版本
+
+    def learn(self):
         """
         执行包含“自对弈->训练->评估->晋升/丢弃”循环的完整学习过程。
+        此版本会持续运行，直到成功晋升了 num_iterations 指定的代数。
         """
-        # 初始时，self.model 就是最优模型
         best_model_info = find_latest_model_file()
         if not best_model_info:
             print("【严重错误】无法找到任何模型文件！程序退出。")
             return
 
-        model_was_promoted = True
-        elo_best_model = 1500
-        for i in range(start_epoch, start_epoch + self.args['num_iterations']):
-            print(f"\n{'=' * 20} 迭代轮次: {i} {'=' * 20}")
+        # --- 新的目标驱动循环控制逻辑 ---
+        model_was_promoted = True  # 标记上一轮尝试是否成功，决定本轮自对弈规模
+        current_model_epoch = best_model_info['epoch']  # 当前冠军模型的代数
+        elo_best_model = 1500  # Elo每次运行可以重新计算
+
+        # 根据配置计算最终的目标代数
+        num_successful_promotions_to_achieve = self.args['num_iterations']
+        target_epoch = current_model_epoch + num_successful_promotions_to_achieve
+
+        print(
+            f"训练启动：当前模型轮次 {current_model_epoch}，目标轮次 {target_epoch} (需要 {num_successful_promotions_to_achieve} 次成功晋升)")
+
+        attempt_num = 0
+        # 循环直到当前模型代数达到目标
+        while current_model_epoch < target_epoch:
+            attempt_num += 1
+            promotions_needed = target_epoch - current_model_epoch
+            # 日志现在会显示还需要多少次成功晋升
+            print(
+                f"\n{'=' * 20} 尝试周期: {attempt_num} | 目标: model_{current_model_epoch + 1} (还需 {promotions_needed} 次晋升) {'=' * 20}")
 
             # --- 步骤 1: 使用当前最优模型进行自对弈 ---
-            # 在 learn 方法内部...
             best_model_path_pt = best_model_info['path'].replace('.pth', '.pt')
-
-            # --- 动态调整逻辑 ---
-            cpp_args = self.args.copy()  # 创建一个临时副本，避免修改原始配置
+            cpp_args = self.args.copy()
             if model_was_promoted:
-                print(f"步骤1: 模型刚晋升，执行一轮完整的自对弈 ({cpp_args['num_selfPlay_episodes']} 局)...")
-                # 使用完整的局数，无需修改 cpp_args
+                print(f"步骤1: 模型刚晋升或首次运行，执行一轮完整的自对弈 ({cpp_args['num_selfPlay_episodes']} 局)...")
             else:
-                # 模型未晋升，只执行少量对弈来刷新数据
                 small_episodes = max(1, int(cpp_args['num_selfPlay_episodes'] * 0.1))
                 cpp_args['num_selfPlay_episodes'] = small_episodes
-                print(f"步骤1: 模型未晋升，执行一轮小规模增量自对弈 ({small_episodes} 局)...")
+                print(f"步骤1: 上次尝试未晋升，执行一轮小规模增量自对弈 ({small_episodes} 局)...")
 
             print(f"   使用模型: '{best_model_path_pt}'")
 
@@ -220,11 +236,10 @@ class Coach:
                 best_model_path_pt,
                 device.type == 'cuda',
                 final_data_queue,
-                cpp_args  # <-- 注意这里使用的是修改后的 cpp_args
+                cpp_args
             )
 
             # --- 步骤 2: 收集数据并放入“滑动窗口”经验池 ---
-            # 这是关键：我们只添加新数据，旧数据会因deque的maxlen而自动淘汰
             print("自对弈完成！正在收集和筛选新数据...")
             games_processed, good_steps_collected, bad_steps_discarded = 0, 0, 0
             policy_entropies = []
@@ -238,9 +253,8 @@ class Coach:
                         for state, policy, value in game_data:
                             if not enable_filtering or np.any(policy):
                                 self.training_data.append((state, policy, value))
-                                # --- 新增：计算并记录策略熵 ---
                                 p_vec = np.array(policy)
-                                p_vec = p_vec[p_vec > 0]  # 过滤掉0概率，避免log(0)
+                                p_vec = p_vec[p_vec > 0]
                                 if p_vec.size > 0:
                                     entropy = -np.sum(p_vec * np.log2(p_vec))
                                     policy_entropies.append(entropy)
@@ -254,24 +268,18 @@ class Coach:
                 f"数据处理完成！本轮共处理 {games_processed} 局, 收集到 {good_steps_collected} 个有效步骤, 丢弃 {bad_steps_discarded} 个。")
             print(f"当前总经验库大小: {len(self.training_data)}")
 
-            # 在 learn 方法的主循环中...
-            # ... (步骤1和步骤2的代码) ...
-
             if len(self.training_data) < self.args['batch_size']:
-                print("警告：经验池数据不足，跳过本轮训练和评估。")
-                model_was_promoted = False  # 确保下一轮是小规模自对弈
+                print("警告：经验池数据不足，跳过本次训练和评估。")
+                model_was_promoted = False
                 continue
 
-            # --- 新增：为多候选循环设置一个标志位 ---
-            promotion_achieved_this_iteration = False
+            promotion_achieved_this_attempt = False
 
-            # --- 新增：包裹“训练-评估-晋升”流程的内循环 ---
+            # --- 步骤 3: 训练与评估候选模型 ---
             for candidate_idx in range(self.args.get('num_candidates_to_train', 1)):
                 print(
                     f"\n{'--' * 15} 正在尝试第 {candidate_idx + 1} / {self.args.get('num_candidates_to_train', 1)} 个候选模型 {'--' * 15}")
 
-                # --- 步骤 3: 训练候选模型 ---
-                # (这部分代码逻辑不变)
                 print("\n步骤3.1: 训练候选模型...")
                 candidate_model = ExtendedConnectNet(
                     board_size=self.args['board_size'], num_res_blocks=self.args['num_res_blocks'],
@@ -280,17 +288,10 @@ class Coach:
                 candidate_model.load_state_dict(self.model.state_dict())
 
                 optimizer = optim.Adam(candidate_model.parameters(), lr=self.args['learning_rate'], weight_decay=0.0001)
-                # --- 修改 self.train 的调用方式，以接收返回值 ---
                 avg_p_loss, avg_v_loss = self.train(candidate_model, optimizer)
-
-                # --- 新增：立即打印本次训练的损失 ---
                 print(f"  - 训练损失: Policy Loss={avg_p_loss:.4f}, Value Loss={avg_v_loss:.4f}")
 
-                # 在 learn 方法的候选模型循环中...
-                # ...
-                # --- 步骤 4: 评估候选模型 vs. 最优模型 (分组对战版) ---
                 print("\n步骤3.2: 评估候选模型 vs. 最优模型...")
-                # ... (创建临时的 candidate.pt 文件，这部分不变) ...
                 candidate_model_path_pt = f"candidate_{candidate_idx}.pt"
                 candidate_model.eval()
                 example_input = torch.rand(1, self.args['num_channels'], self.args['board_size'],
@@ -298,100 +299,74 @@ class Coach:
                 traced_script_module = torch.jit.trace(candidate_model, example_input)
                 traced_script_module.save(candidate_model_path_pt)
 
-                # --- 新增：分组对战逻辑 ---
                 use_gpu = (device.type == 'cuda')
-                # 从配置文件读取总评估局数，除以2得到每组的局数 (例如，配置20局，则每组10局)
                 games_per_side = self.args.get('num_eval_games', 20) // 2
-
                 eval_args = self.args.copy()
                 eval_args['num_eval_games'] = games_per_side
                 eval_args['num_eval_simulations'] = self.args['num_searches']
 
-                # --- 实验一：新模型执先手 (黑方) ---
-                print(f"  - [实验一] 新模型执黑，进行 {games_per_side} 局...")
                 results1 = cpp_mcts_engine.run_parallel_evaluation(
-                    best_model_path_pt,  # model1 (旧)
-                    candidate_model_path_pt,  # model2 (新)
-                    use_gpu,
-                    eval_args,
-                    mode=2  # mode=2: model2执黑
+                    best_model_path_pt, candidate_model_path_pt, use_gpu, eval_args, mode=2
                 )
-                new_as_p1_wins = results1.get("model2_wins", 0)
-                old_as_p2_wins = results1.get("model1_wins", 0)
-                draws1 = results1.get("draws", 0)
-
-                # --- 实验二：新模型执后手 (白方) ---
-                print(f"  - [实验二] 新模型执白，进行 {games_per_side} 局...")
                 results2 = cpp_mcts_engine.run_parallel_evaluation(
-                    best_model_path_pt,  # model1 (旧)
-                    candidate_model_path_pt,  # model2 (新)
-                    use_gpu,
-                    eval_args,
-                    mode=1  # mode=1: model1执黑
+                    best_model_path_pt, candidate_model_path_pt, use_gpu, eval_args, mode=1
                 )
-                old_as_p1_wins = results2.get("model1_wins", 0)
-                new_as_p2_wins = results2.get("model2_wins", 0)
-                draws2 = results2.get("draws", 0)
 
-                # --- 汇总和计算总成绩 ---
-                # 这里我们将新模型(model2)作为我们关心的主体
-                total_new_model_wins = new_as_p1_wins + new_as_p2_wins
-                total_old_model_wins = old_as_p2_wins + old_as_p1_wins
-                total_draws = draws1 + draws2
+                total_new_model_wins = results1.get("model2_wins", 0) + results2.get("model2_wins", 0)
+                total_old_model_wins = results1.get("model1_wins", 0) + results2.get("model1_wins", 0)
+                total_draws = results1.get("draws", 0) + results2.get("draws", 0)
                 total_games = total_new_model_wins + total_old_model_wins + total_draws
-
                 win_rate = total_new_model_wins / total_games if total_games > 0 else 0
 
-                # 打印详细和汇总的评估结果
                 print("\n评估总结:")
-                print(f"  - 新模型执黑时 (新 vs 旧): {new_as_p1_wins} 胜 / {old_as_p2_wins} 负 / {draws1} 平")
-                print(f"  - 新模型执白时 (旧 vs 新): {new_as_p2_wins} 胜 / {old_as_p1_wins} 负 / {draws2} 平")
+                print(
+                    f"  - 新模型执黑时 (新 vs 旧): {results1.get('model2_wins', 0)} 胜 / {results1.get('model1_wins', 0)} 负 / {results1.get('draws', 0)} 平")
+                print(
+                    f"  - 新模型执白时 (旧 vs 新): {results2.get('model2_wins', 0)} 胜 / {results2.get('model1_wins', 0)} 负 / {results2.get('draws', 0)} 平")
                 print(
                     f"  - 综合战绩 (新 vs 旧): {total_new_model_wins} 胜 / {total_old_model_wins} 负 / {total_draws} 平")
                 print(f"  - 新模型综合胜率: {win_rate:.2%}")
 
-                # --- 更新Elo计算部分以使用新的汇总变量 ---
-                # 注意：这里的变量名要和上面汇总部分的变量名对上
                 elo_candidate = elo_best_model
-
                 expected_win_rate_candidate = 1 / (1 + 10 ** ((elo_best_model - elo_candidate) / 400))
-
-                # 使用汇总后的总得分
                 actual_score_candidate = total_new_model_wins + 0.5 * total_draws
                 expected_score_candidate = expected_win_rate_candidate * total_games
-
                 k_factor = self.args.get('elo_k_factor', 32)
-                # 注意：这里我们只关心候选模型的新Elo，因为旧模型的Elo只是一个相对的基准
                 new_elo_candidate = elo_candidate + k_factor * (actual_score_candidate - expected_score_candidate)
 
-                elo_change_candidate = new_elo_candidate - elo_candidate
-                print(f"  - Elo 评级: BestNet ({elo_best_model:.0f}) vs Candidate ({elo_candidate:.0f})")
-                print(f"  - Elo 变化: Candidate Elo -> {new_elo_candidate:.0f} ({elo_change_candidate:+.0f})")
+                print(f"  - Elo 评级: BestNet ({elo_best_model:.0f}) vs Candidate ({elo_best_model:.0f})")
+                print(
+                    f"  - Elo 变化: Candidate Elo -> {new_elo_candidate:.0f} ({new_elo_candidate - elo_candidate:+.0f})")
 
-                # ... (后续是删除临时文件和模型晋升逻辑，保持不变) ...
-
-                # 总是删除临时的候选模型文件
                 if os.path.exists(candidate_model_path_pt):
                     os.remove(candidate_model_path_pt)
 
-                # --- 步骤 5: 优胜劣汰 (修改后的逻辑) ---
                 if win_rate >= 0.55:
-                    print(f"【模型晋升】候选 {candidate_idx + 1} 胜率达标，将其保存为 model_{i} 并设为新的最优模型。")
-                    promotion_achieved_this_iteration = True
-                    elo_best_model = new_elo_candidate  # <-- 新增此行，传递Elo
+                    next_model_epoch = current_model_epoch + 1
+
+                    print(
+                        f"【模型晋升】候选 {candidate_idx + 1} 胜率达标，将其保存为 model_{next_model_epoch} 并设为新的最优模型。")
+                    elo_best_model = new_elo_candidate
                     self.model.load_state_dict(candidate_model.state_dict())
-                    save_model(self.model, i, self.args)
+                    save_model(self.model, next_model_epoch, self.args)
                     best_model_info = find_latest_model_file()
+
+                    # 更新循环控制变量，向目标迈进一步
+                    current_model_epoch = next_model_epoch
+                    promotion_achieved_this_attempt = True
+
                     break
                 else:
                     print(f"【模型丢弃】候选 {candidate_idx + 1} 胜率未达标。")
 
-            # --- 循环结束后，根据本轮是否发生晋升来更新下一轮的自对弈标志位 ---
-            model_was_promoted = promotion_achieved_this_iteration
+            model_was_promoted = promotion_achieved_this_attempt
 
-            print(f"\n{'=' * 20} 迭代轮次: {i} 总结 {'=' * 20}")
+            if not model_was_promoted:
+                print(f"\n--- 本次尝试未能晋升，将继续尝试击败 model_{current_model_epoch} ---")
+
+            print(f"\n{'=' * 20} 尝试周期 {attempt_num} 总结 {'=' * 20}")
             print("性能指标:")
-            print(f"  - 当前最优模型 Elo: {elo_best_model:.0f}")
+            print(f"  - 当前最优模型 Elo: {elo_best_model:.0f} (model_{current_model_epoch})")
             print("行为统计 (来自本轮自对弈):")
             avg_entropy = np.mean(policy_entropies) if policy_entropies else 0
             print(f"  - 平均MCTS策略熵: {avg_entropy:.3f} bits")
@@ -399,7 +374,8 @@ class Coach:
 
             clear_windows_memory()
 
-        print(f"\n全部 {self.args['num_iterations']} 轮迭代完成！")
+        print(
+            f"\n训练目标达成！已成功晋升 {num_successful_promotions_to_achieve} 代新模型，最终模型为 model_{current_model_epoch}。")
 
     # 这个函数保留，用于最终的、更详细的评估报告，或者可以被手动调用
     def evaluate_models(self, model1_info, model2_info):
@@ -544,7 +520,7 @@ if __name__ == '__main__':
 
     # --- 启动训练 ---
     coach = Coach(current_model, args)
-    coach.learn(start_epoch=start_epoch)
+    coach.learn()
 
     print("\n训练全部完成，正在手动清理内存...")
     if 'coach' in locals() and hasattr(coach, 'training_data'):
