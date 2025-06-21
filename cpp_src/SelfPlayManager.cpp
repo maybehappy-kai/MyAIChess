@@ -11,7 +11,7 @@
 
 struct MCTS_Config;   // 先声明MCTS_Config结构体
 enum class MCTS_MODE; // 再声明MCTS_MODE枚举
-std::pair<int, std::vector<float>> find_best_action_by_mcts(
+std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
     const Gomoku &root_state,
     const std::deque<BitboardState> &history,
     InferenceEngine &engine,
@@ -356,7 +356,7 @@ enum class MCTS_MODE
 
 // file: cpp_src/SelfPlayManager.cpp (文件中部)
 // vvvvvv 【核心修改】 vvvvvv
-std::pair<int, std::vector<float>> find_best_action_by_mcts(
+std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
     const Gomoku &root_state,
     const std::deque<BitboardState> &history,
     InferenceEngine &engine,
@@ -655,8 +655,13 @@ std::pair<int, std::vector<float>> find_best_action_by_mcts(
         }
     }
     // --- 修正结束 ---
+    double mcts_value = 0.0;
+    if (root->visit_count_ > 0) {
+        // root是Node*类型，指向MCTS的根节点
+        mcts_value = root->value_sum_ / root->visit_count_;
+    }
 
-    return {action, action_probs};
+    return {action, action_probs, mcts_value};
 }
 
 // =============================================================
@@ -828,7 +833,7 @@ void SelfPlayManager::worker_func(int worker_id)
             TrivialArena gomoku_arena(32 * 1024 * 1024); // 32MB 给 Gomoku 缓存
             Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
             std::deque<BitboardState> game_history;
-            std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
+            std::vector<std::tuple<std::vector<float>, std::vector<float>, double>> episode_data;
 
             // 【已加回】根据您的反馈，保留 action_size 的初始化
             const int action_size = game.get_board_size() * game.get_board_size();
@@ -842,10 +847,21 @@ void SelfPlayManager::worker_func(int worker_id)
                     // 如果结束，整理并提交本局所有数据，然后跳出循环
                     TrainingDataPacket cpp_training_examples;
                     cpp_training_examples.reserve(episode_data.size());
-                    for (const auto &example : episode_data)
+                    int current_player_at_end = game.get_current_player();
+
+                    for (auto it = episode_data.rbegin(); it != episode_data.rend(); ++it)
                     {
-                        double corrected_value = final_value * std::get<2>(example);
-                        cpp_training_examples.emplace_back(std::get<0>(example), std::get<1>(example), corrected_value);
+                        // 新逻辑：直接使用MCTS评估值
+                        // MCTS的价值是从当前玩家视角看的，所以轮到谁，价值就是谁的
+                        // 价值的符号在反向传播时已经处理好，这里直接使用即可
+                        double final_z = std::get<2>(*it);
+
+                        // 我们需要从后往前遍历，因为mcts_value是针对那个时刻的玩家的。
+                        // 训练时，价值z需要统一为根节点玩家（P1）的视角。
+                        // 在我们的框架中，价值网络总是预测当前玩家的胜率。
+                        // 而我们存储的mcts_value已经是当前玩家的视角，所以无需改变符号。
+
+                        cpp_training_examples.emplace_back(std::get<0>(*it), std::get<1>(*it), final_z);
                     }
                     data_collector_queue_.push(std::move(cpp_training_examples));
                     completed_games_count_++;
@@ -854,18 +870,18 @@ void SelfPlayManager::worker_func(int worker_id)
 
                 // 2. 【后执行】如果游戏未结束，才为当前状态寻找最佳动作
                 const Gomoku root_state(game);
-                auto [action, action_probs] = find_best_action_by_mcts(
+                auto [action, action_probs, mcts_value] = find_best_action_by_mcts(
                     root_state,
                     game_history,
                     *engine_,
                     this->mcts_config_,
                     MCTS_MODE::SELF_PLAY,
-                    node_arena,  // <-- 传入node_arena
-                    gomoku_arena // <-- 传入gomoku_arena
+                    node_arena,
+                    gomoku_arena
                 );
 
                 // 3. 存储【有效】的训练数据
-                episode_data.emplace_back(root_state.get_state(game_history), action_probs, game.get_current_player());
+                episode_data.emplace_back(root_state.get_state(game_history), action_probs, mcts_value);
 
                 // 4. 更新历史记录并执行动作
                 game_history.push_front(game.get_bitboard_state());
@@ -1031,14 +1047,14 @@ void EvaluationManager::worker_func(int worker_id)
                 auto &current_engine = models.at(game.get_current_player());
 
                 // 调用统一的MCTS核心函数，模式为EVALUATION
-                auto [action, policy] = find_best_action_by_mcts(
+                auto [action, policy, mcts_value] = find_best_action_by_mcts(
                     root_state,
                     game_history,
                     *current_engine,
                     this->mcts_config_,
-                    MCTS_MODE::EVALUATION, // 指定为评估模式
-                    node_arena,            // <-- 传入node_arena
-                    gomoku_arena           // <-- 传入gomoku_arena
+                    MCTS_MODE::EVALUATION,
+                    node_arena,
+                    gomoku_arena
                 );
                 // 在评估中，我们不关心返回的policy，所以可以忽略
 
@@ -1221,14 +1237,14 @@ int find_best_action_for_state(
         py::gil_scoped_release release;
 
         // 调用统一的MCTS核心函数
-        auto [best_action, policy] = find_best_action_by_mcts(
+        auto [best_action, policy, mcts_value] = find_best_action_by_mcts(
             root_state,
             history,
             *engine,
             config,
             MCTS_MODE::EVALUATION,
-            node_arena,  // <-- 传入node_arena
-            gomoku_arena // <-- 传入gomoku_arena
+            node_arena,
+            gomoku_arena
         );
         final_action = best_action;
     }

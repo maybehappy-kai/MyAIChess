@@ -406,7 +406,7 @@ class Coach:
         print(f"新模型综合胜率: {overall_win_rate:.2%}")
 
         if games_per_side > 0 and (new_as_p1_wins / games_per_side) > 0.9 and (old_as_p1_wins / games_per_side) > 0.9:
-            print("\n【诊断结论】: AI已发现并掌握了 '先手必胜' 策略。")
+            print("\n【诊断结论】: AI已发现并掌握了 '先手必胜' 策略（可能是局部最优，需后续验证）。")
         elif overall_win_rate > self.args.get('eval_win_rate', 0.52):
             print("\n【诊断结论】: 新模型有显著提升！👍")
         else:
