@@ -286,66 +286,89 @@ class Coach:
                 # --- 新增：立即打印本次训练的损失 ---
                 print(f"  - 训练损失: Policy Loss={avg_p_loss:.4f}, Value Loss={avg_v_loss:.4f}")
 
-                # --- 步骤 4: 评估候选模型 vs. 最优模型 ---
-                # (这部分代码逻辑不变)
+                # 在 learn 方法的候选模型循环中...
+                # ...
+                # --- 步骤 4: 评估候选模型 vs. 最优模型 (分组对战版) ---
                 print("\n步骤3.2: 评估候选模型 vs. 最优模型...")
-                candidate_model_path_pt = f"candidate_{candidate_idx}.pt"  # 使用索引避免文件名冲突
+                # ... (创建临时的 candidate.pt 文件，这部分不变) ...
+                candidate_model_path_pt = f"candidate_{candidate_idx}.pt"
                 candidate_model.eval()
                 example_input = torch.rand(1, self.args['num_channels'], self.args['board_size'],
                                            self.args['board_size']).to(device)
                 traced_script_module = torch.jit.trace(candidate_model, example_input)
                 traced_script_module.save(candidate_model_path_pt)
 
+                # --- 新增：分组对战逻辑 ---
+                use_gpu = (device.type == 'cuda')
+                # 从配置文件读取总评估局数，除以2得到每组的局数 (例如，配置20局，则每组10局)
+                games_per_side = self.args.get('num_eval_games', 20) // 2
+
                 eval_args = self.args.copy()
-                eval_args['num_eval_games'] = self.args.get('num_eval_games', 20) // 2
+                eval_args['num_eval_games'] = games_per_side
                 eval_args['num_eval_simulations'] = self.args['num_searches']
 
-                results = cpp_mcts_engine.run_parallel_evaluation(
-                    best_model_path_pt,
-                    candidate_model_path_pt,
-                    device.type == 'cuda',
+                # --- 实验一：新模型执先手 (黑方) ---
+                print(f"  - [实验一] 新模型执黑，进行 {games_per_side} 局...")
+                results1 = cpp_mcts_engine.run_parallel_evaluation(
+                    best_model_path_pt,  # model1 (旧)
+                    candidate_model_path_pt,  # model2 (新)
+                    use_gpu,
                     eval_args,
-                    mode=0
+                    mode=2  # mode=2: model2执黑
                 )
+                new_as_p1_wins = results1.get("model2_wins", 0)
+                old_as_p2_wins = results1.get("model1_wins", 0)
+                draws1 = results1.get("draws", 0)
 
-                model1_wins = results.get("model1_wins", 0)
-                model2_wins = results.get("model2_wins", 0)
-                draws = results.get("draws", 0)
-                total_games = model1_wins + model2_wins + draws
-                win_rate = model2_wins / total_games if total_games > 0 else 0
+                # --- 实验二：新模型执后手 (白方) ---
+                print(f"  - [实验二] 新模型执白，进行 {games_per_side} 局...")
+                results2 = cpp_mcts_engine.run_parallel_evaluation(
+                    best_model_path_pt,  # model1 (旧)
+                    candidate_model_path_pt,  # model2 (新)
+                    use_gpu,
+                    eval_args,
+                    mode=1  # mode=1: model1执黑
+                )
+                old_as_p1_wins = results2.get("model1_wins", 0)
+                new_as_p2_wins = results2.get("model2_wins", 0)
+                draws2 = results2.get("draws", 0)
 
-                print(f"评估结果: 新 vs. 旧 | 胜/负/平: {model2_wins} / {model1_wins} / {draws}")
-                print(f"新模型胜率: {win_rate:.2%}")
+                # --- 汇总和计算总成绩 ---
+                # 这里我们将新模型(model2)作为我们关心的主体
+                total_new_model_wins = new_as_p1_wins + new_as_p2_wins
+                total_old_model_wins = old_as_p2_wins + old_as_p1_wins
+                total_draws = draws1 + draws2
+                total_games = total_new_model_wins + total_old_model_wins + total_draws
 
-                # ... 紧跟在打印胜率之后 ...
+                win_rate = total_new_model_wins / total_games if total_games > 0 else 0
 
-                # --- 新增：Elo计算 ---
-                elo_candidate = elo_best_model  # 候选模型挑战时，默认其Elo与当前最优模型相同
+                # 打印详细和汇总的评估结果
+                print("\n评估总结:")
+                print(f"  - 新模型执黑时 (新 vs 旧): {new_as_p1_wins} 胜 / {old_as_p2_wins} 负 / {draws1} 平")
+                print(f"  - 新模型执白时 (旧 vs 新): {new_as_p2_wins} 胜 / {old_as_p1_wins} 负 / {draws2} 平")
+                print(
+                    f"  - 综合战绩 (新 vs 旧): {total_new_model_wins} 胜 / {total_old_model_wins} 负 / {total_draws} 平")
+                print(f"  - 新模型综合胜率: {win_rate:.2%}")
 
-                # 1. 计算期望胜率
+                # --- 更新Elo计算部分以使用新的汇总变量 ---
+                # 注意：这里的变量名要和上面汇总部分的变量名对上
+                elo_candidate = elo_best_model
+
                 expected_win_rate_candidate = 1 / (1 + 10 ** ((elo_best_model - elo_candidate) / 400))
-                expected_win_rate_best = 1 - expected_win_rate_candidate
 
-                # 2. 计算实际得分（赢=1, 平=0.5, 输=0）
-                actual_score_candidate = model2_wins + 0.5 * draws
-                actual_score_best = model1_wins + 0.5 * draws
-
-                # 3. 计算期望得分
+                # 使用汇总后的总得分
+                actual_score_candidate = total_new_model_wins + 0.5 * total_draws
                 expected_score_candidate = expected_win_rate_candidate * total_games
-                expected_score_best = expected_win_rate_best * total_games
 
-                # 4. 更新Elo
                 k_factor = self.args.get('elo_k_factor', 32)
+                # 注意：这里我们只关心候选模型的新Elo，因为旧模型的Elo只是一个相对的基准
                 new_elo_candidate = elo_candidate + k_factor * (actual_score_candidate - expected_score_candidate)
-                new_elo_best = elo_best_model + k_factor * (actual_score_best - expected_score_best)
 
-                # 打印Elo变化
                 elo_change_candidate = new_elo_candidate - elo_candidate
                 print(f"  - Elo 评级: BestNet ({elo_best_model:.0f}) vs Candidate ({elo_candidate:.0f})")
                 print(f"  - Elo 变化: Candidate Elo -> {new_elo_candidate:.0f} ({elo_change_candidate:+.0f})")
 
-                # 总是删除临时的候选模型文件
-                # ...
+                # ... (后续是删除临时文件和模型晋升逻辑，保持不变) ...
 
                 # 总是删除临时的候选模型文件
                 if os.path.exists(candidate_model_path_pt):
@@ -360,7 +383,7 @@ class Coach:
                     save_model(self.model, i, self.args)
                     best_model_info = find_latest_model_file()
                     break
-            else:
+                else:
                     print(f"【模型丢弃】候选 {candidate_idx + 1} 胜率未达标。")
 
             # --- 循环结束后，根据本轮是否发生晋升来更新下一轮的自对弈标志位 ---
