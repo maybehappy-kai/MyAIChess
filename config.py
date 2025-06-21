@@ -6,7 +6,7 @@ args = {
     'num_iterations': 1,
     'num_selfPlay_episodes': 100,
     'num_cpu_threads': 18,
-    'num_epochs': 4,
+    'training_steps_per_iteration': 1000, # 每次迭代训练1000个mini-batch
     'batch_size': 128,
     'learning_rate': 0.001,
     'data_max_size': 200000,
@@ -15,6 +15,8 @@ args = {
     'dirichlet_alpha': 0.3,
     'dirichlet_epsilon': 0.25,
     'value_loss_weight': 1,
+    'elo_k_factor': 32,
+    'num_candidates_to_train': 3, # 每轮自对弈后，尝试训练3个候选模型
 
     # 温度采样参数
     'temperature_start': 1.0,

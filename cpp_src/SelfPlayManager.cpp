@@ -1069,7 +1069,7 @@ void EvaluationManager::worker_func(int worker_id)
                 }
                 game.execute_move(action);
 
-                if (worker_id == 0)
+                /*if (worker_id == 0)
                 {
                     std::lock_guard<std::mutex> lock(g_io_mutex);
                     std::cout << "\n=======================================================\n";
@@ -1077,7 +1077,7 @@ void EvaluationManager::worker_func(int worker_id)
                     std::cout << "Player " << game.get_current_player() * -1 << " (Engine: " << ((current_engine == engine1_) ? "Model1-Old" : "Model2-New") << ") chose action: " << action << "\n";
                     game.print_board();
                     std::cout << "=======================================================\n";
-                }
+                }*/
 
                 auto [final_value, is_done] = game.get_game_ended();
                 if (is_done)
