@@ -359,7 +359,7 @@ class Coach:
                     self.model.load_state_dict(candidate_model.state_dict())
                     save_model(self.model, i, self.args)
                     best_model_info = find_latest_model_file()
-                    br
+                    break
             else:
                     print(f"【模型丢弃】候选 {candidate_idx + 1} 胜率未达标。")
 
