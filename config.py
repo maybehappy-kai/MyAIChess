@@ -36,7 +36,7 @@ args = {
     'board_size': 9,
     'num_rounds': 25,
     'mcts_batch_size': 64,
-    'filter_zero_policy_data': True,
+    'filter_zero_policy_data': False,
     'enable_opening_bias': True,
     'opening_bias_strength': 0.1,
     'enable_ineffective_connection_penalty': True,

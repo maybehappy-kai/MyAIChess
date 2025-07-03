@@ -398,12 +398,6 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
             if (is_terminal)
             {
                 // 如果是终局，直接反向传播结果，无需神经网络
-                Node *temp_node = node;
-                while (temp_node != nullptr)
-                {
-                    temp_node->virtual_loss_count_--; // 偿还虚拟损失
-                    temp_node = temp_node->parent_;
-                }
                 double value_to_propagate = end_value * current_node_state.get_current_player();
                 node->backpropagate(value_to_propagate);
             }
@@ -428,6 +422,8 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
             state_batch.push_back(leaf_state.get_state(leaf_history));
         }
         auto [policy_batch, value_batch] = engine.infer(state_batch, root_state.get_board_size(), config.num_channels);
+
+
 
         // ================== 1c. 扩展和反向传播 (结构优化版) ==================
         for (size_t k = 0; k < leaves_batch.size(); ++k)
@@ -503,6 +499,8 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
                     apply_ineffective_connection_penalty(current_policy, leaf_state_for_expansion, config.ineffective_connection_penalty_factor);
                 }
             }
+
+
 
             // --- 通用逻辑区 ---
             // 以下逻辑对所有叶子节点（包括根节点）生效
@@ -660,6 +658,8 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
         // root是Node*类型，指向MCTS的根节点
         mcts_value = root->value_sum_ / root->visit_count_;
     }
+
+
 
     return {action, action_probs, mcts_value};
 }
