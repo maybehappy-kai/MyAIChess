@@ -24,7 +24,7 @@ args = {
     # --- 模仿学习相关 ---
     'expert_data_ratio': 0.25,
     'expert_data_max_size': 2000,
-    'label_smoothing_alpha': 0.03,
+    'label_smoothing_alpha': 0.1,
 
     # --- 其他游戏和MCTS参数 ---
     'elo_k_factor': 32,
