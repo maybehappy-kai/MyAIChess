@@ -86,6 +86,57 @@ def transfer_weights(new_model, path_to_old_weights):
     return new_model
 
 
+# --- 在 coach.py 中添加此函数 ---
+def remove_old_models(args, keep_max=3):
+    """
+    清理旧模型，只保留最新的 keep_max 个版本的模型文件 (.pth 和 .pt)。
+    """
+    path = "."
+    # 匹配模型文件的正则，例如: model_10_5x128_20c.pth
+    # 这里的正则要足够宽容以匹配 .pth 和 .pt
+    pattern = re.compile(r"model_(\d+)_.*")
+
+    # 1. 扫描所有模型文件并按 epoch 分组
+    found_models = {}  # 格式: {epoch: [file_path1, file_path2]}
+
+    for f in os.listdir(path):
+        # 只处理文件
+        if not os.path.isfile(os.path.join(path, f)):
+            continue
+
+        match = pattern.match(f)
+        if match:
+            # 排除 candidate 模型，只处理正式的 model_
+            if "candidate" in f:
+                continue
+
+            epoch = int(match.group(1))
+            if epoch not in found_models:
+                found_models[epoch] = []
+            found_models[epoch].append(f)
+
+    # 2. 如果总版本数少于保留数，不需要清理
+    if len(found_models) <= keep_max:
+        return
+
+    # 3. 按 epoch 从小到大排序
+    sorted_epochs = sorted(found_models.keys())
+
+    # 4. 找出需要删除的 epoch (即除了最后 keep_max 个之外的所有 epoch)
+    epochs_to_delete = sorted_epochs[:-keep_max]
+
+    # 5. 执行删除
+    print(f"\n[清理] 正在移除旧模型权重 (保留最近 {keep_max} 个版本)...")
+    for epoch in epochs_to_delete:
+        files = found_models[epoch]
+        for file_name in files:
+            try:
+                os.remove(file_name)
+                print(f"  - 已删除: {file_name}")
+            except Exception as e:
+                print(f"  - 删除失败 {file_name}: {e}")
+
+
 def save_model(model, epoch, args):
     num_channels = args['num_channels']
     base_filename = f"model_{epoch}_{args['num_res_blocks']}x{args['num_hidden']}_{num_channels}c"
@@ -102,6 +153,11 @@ def save_model(model, epoch, args):
         print(f"TorchScript模型 {model_path_pt} 已成功导出。")
     except Exception as e:
         print(f"【错误】导出TorchScript模型失败: {e}")
+
+    # ==================== 新增代码 ====================
+    # 3. 调用清理函数，移除过期的旧权重
+    remove_old_models(args, keep_max=3)
+    # ================================================
 
 
 def find_latest_model_file():

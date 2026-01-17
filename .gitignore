@@ -194,3 +194,21 @@ cython_debug/
 .cursorindexingignore
 
 .idea/
+
+# --- MyAIChess Specific Ignore Rules ---
+
+# 1. 忽略所有模型权重文件
+*.pth
+*.pt
+*.ckpt
+
+# 2. 忽略所有数据文件 (包括专家数据和自对弈数据)
+*.pkl
+
+# 3. 忽略数据缓冲区目录中的内容 (但保留目录本身)
+data_buffer/*
+!data_buffer/.gitkeep
+
+# 4. 忽略可能生成的日志或临时文件
+*.log
+tfevents*

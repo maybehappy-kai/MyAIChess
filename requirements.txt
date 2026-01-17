@@ -1,0 +1,18 @@
+# 指定 PyTorch 的 CUDA 11.8 软件源 (与之前教程一致)
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# 核心深度学习框架
+torch
+torchvision
+torchaudio
+
+# 数学与进度条工具
+numpy
+tqdm
+
+# 游戏界面与交互
+pygame
+
+# C++ 扩展编译依赖
+pybind11
+setuptools
