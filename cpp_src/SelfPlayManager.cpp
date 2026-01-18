@@ -908,12 +908,12 @@ void SelfPlayManager::worker_func(int worker_id)
 // ====================== 新增：高效并行评估的完整实现 ======================
 
 // C++评估任务的顶层入口
-py::dict run_parallel_evaluation(const std::string &model1_path, const std::string &model2_path, bool use_gpu, py::dict args, int mode)
+py::dict run_parallel_evaluation(const std::string &model1_path, const std::string &model2_path, bool use_gpu, py::dict args, int mode, py::list initial_states)
 { // <-- 增加mode参数
     auto engine1 = std::make_shared<InferenceEngine>(model1_path, use_gpu);
     auto engine2 = std::make_shared<InferenceEngine>(model2_path, use_gpu);
 
-    auto eval_manager = std::make_shared<EvaluationManager>(engine1, engine2, args, mode); // <-- 将mode传给构造函数
+    auto eval_manager = std::make_shared<EvaluationManager>(engine1, engine2, args, mode, initial_states); // <--- 传入 initial_states
 
     std::thread cpp_eval_thread([eval_manager]()
                                 { eval_manager->run(); });
@@ -933,7 +933,8 @@ EvaluationManager::EvaluationManager(
     std::shared_ptr<InferenceEngine> engine1,
     std::shared_ptr<InferenceEngine> engine2,
     py::dict args,
-    int mode)
+    int mode,
+    py::list initial_states) // <--- 参数增加
     : engine1_(engine1), engine2_(engine2), evaluation_mode_(mode)
 {
     // 非 MCTS 参数
@@ -969,6 +970,38 @@ EvaluationManager::EvaluationManager(
     this->scores_[1] = 0;  // 为"模型1胜利"初始化
     this->scores_[-1] = 0; // 为"模型2胜利"初始化
     this->scores_[0] = 0;  // 为"平局"初始化
+
+    // 3. 【新增】解析 Python 传来的开局状态列表
+    if (initial_states.size() == 0) {
+        throw std::runtime_error("EvaluationManager received empty initial_states list!");
+    }
+
+    initial_states_.reserve(initial_states.size());
+    for (const auto& item : initial_states) {
+        py::dict s = item.cast<py::dict>();
+        EvalInitialState state;
+
+        py::list b_stones = s["black_stones"].cast<py::list>();
+        state.black_stones[0] = b_stones[0].cast<uint64_t>();
+        state.black_stones[1] = b_stones[1].cast<uint64_t>();
+
+        py::list w_stones = s["white_stones"].cast<py::list>();
+        state.white_stones[0] = w_stones[0].cast<uint64_t>();
+        state.white_stones[1] = w_stones[1].cast<uint64_t>();
+
+        py::list b_terr = s["black_territory"].cast<py::list>();
+        state.black_territory[0] = b_terr[0].cast<uint64_t>();
+        state.black_territory[1] = b_terr[1].cast<uint64_t>();
+
+        py::list w_terr = s["white_territory"].cast<py::list>();
+        state.white_territory[0] = w_terr[0].cast<uint64_t>();
+        state.white_territory[1] = w_terr[1].cast<uint64_t>();
+
+        state.current_player = s["current_player"].cast<int>();
+        state.current_move_number = s["current_move_number"].cast<int>();
+
+        initial_states_.push_back(state);
+    }
 }
 
 py::dict EvaluationManager::get_results() const
@@ -1015,7 +1048,21 @@ void EvaluationManager::worker_func(int worker_id)
             // ... 在 EvaluationManager::worker_func 的 try 块内部 ...
             TrivialArena node_arena(100 * 1024 * 1024);
             TrivialArena gomoku_arena(32 * 1024 * 1024);
-            Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
+            // 从预加载的开局状态中取出一个 (循环使用)
+            const auto& init_state = initial_states_[game_idx % initial_states_.size()];
+
+            // 使用重载构造函数，直接“瞬移”到指定局面
+            Gomoku game(
+                this->board_size_,
+                this->num_rounds_ * 2, // 注意：这里需要传总步数 (rounds * 2)
+                init_state.current_player,
+                init_state.current_move_number,
+                init_state.black_stones,
+                init_state.white_stones,
+                init_state.black_territory,
+                init_state.white_territory,
+                this->mcts_config_.history_steps
+            );
             std::deque<BitboardState> game_history;
 
             // vvvvvv 【全新的、更简洁的修正逻辑】 vvvvvv

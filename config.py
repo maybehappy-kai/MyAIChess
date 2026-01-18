@@ -18,7 +18,7 @@ args = {
     # --- 训练与评估的核心超参数 ---
     'learning_rate': 0.001,
     'weight_decay': 0.0001,  # <--- 修正: 加上这一行
-    'promotion_win_rate': 0.55,  # <--- 修正: 加上这一行
+    'promotion_win_rate': 0.50,  # <--- 修正: 加上这一行
     'failed_selfplay_ratio': 0.1,  # <--- 修正: 加上这一行
 
     # --- 模仿学习相关 ---

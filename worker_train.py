@@ -9,6 +9,7 @@ import torch.optim as optim
 import numpy as np
 import platform
 import ctypes
+import re
 
 # --- 关键配置 ---
 TRAINER_DEVICE_ID = 1
@@ -17,7 +18,7 @@ TRAINER_DEVICE_ID = 1
 os.environ["CUDA_VISIBLE_DEVICES"] = str(TRAINER_DEVICE_ID)
 
 import coach
-from coach import Coach, save_model, find_latest_model_file
+from coach import Coach, save_model, find_latest_model_file, prepare_eval_states
 from neural_net import ExtendedConnectNet
 from config import args
 import cpp_mcts_engine
@@ -158,41 +159,106 @@ def main():
         policy_loss, value_loss = trainer.train(model, optimizer)
         print(f"Loss: P={policy_loss:.4f}, V={value_loss:.4f}")
 
-        # --- D. 评估与晋升 ---
+        # --- D. 评估与晋升 (车轮战模式) ---
         candidate_path = "candidate_model.pt"
         try:
             model.eval()
+            # 导出候选模型 (保持不变)
             traced = torch.jit.trace(model,
                                      torch.rand(1, args['num_channels'], args['board_size'], args['board_size']).to(
                                          device))
             traced.save(candidate_path)
 
             best_info = find_latest_model_file()
-            best_model_path = best_info['path'].replace('.pth', '.pt')
+            # 注意：best_info['path'] 是 .pth，我们需要 .pt
+            # 但这里我们要重写逻辑去寻找最近的3个模型
 
-            eval_args = args.copy()
-            eval_args['num_eval_games'] = args.get('num_eval_games', 20) // 2
-            eval_args['num_eval_simulations'] = args['num_searches']
+            # 1. 寻找对手 (最近的3个模型)
+            # 排除 candidate 和非 .pt 文件 (find_latest_model_file 找的是 pth，我们这里直接扫目录找 pt 更方便用于推理)
+            pt_files = glob.glob("model_*.pt")
+            # 提取 epoch 数字并排序
+            sorted_pts = sorted([f for f in pt_files if "candidate" not in f],
+                                key=lambda x: int(re.search(r"model_(\d+)", x).group(1)), reverse=True)
 
-            print("正在评估...")
-            res1 = cpp_mcts_engine.run_parallel_evaluation(best_model_path, candidate_path, True, eval_args, 2)
-            res2 = cpp_mcts_engine.run_parallel_evaluation(best_model_path, candidate_path, True, eval_args, 1)
+            opponents = sorted_pts[:3]
+            # 如果没找到任何 .pt (可能是第一次运行)，就用刚导出的 candidate 自己打自己，或者跳过
+            if not opponents:
+                print("未找到历史模型，跳过评估，直接晋升 (首轮)。")
+                win_rate = 1.0
+                pass_all_checks = True
+                avg_win_rate = 1.0
+            else:
+                print(f"评估对手: {opponents}")
 
-            wins = res1.get("model2_wins", 0) + res2.get("model2_wins", 0)
-            losses = res1.get("model1_wins", 0) + res2.get("model1_wins", 0)
-            total = wins + losses + res1.get("draws", 0) + res2.get("draws", 0)
-            win_rate = wins / total if total > 0 else 0
+                # 2. 准备开局数据
+                # 确保有足够的数据用于抽取
+                if len(trainer.self_play_data) < 10:
+                    print("数据不足，无法抽取开局，跳过评估。")
+                    continue
 
-            print(f"胜率: {win_rate:.2%} ({wins}胜 {losses}负)")
+                games_per_opponent = args.get('num_eval_games', 20) // 2  # 减半，因为要跑3轮
+                # 这里的 games_per_opponent 指的是单侧局数，还是总局数？
+                # 原逻辑 eval_args['num_eval_games'] = args.get('num_eval_games', 20) // 2
+                # 我们保持一致，让 args['num_eval_games'] 代表"每一轮车轮战的总局数"
 
-            if win_rate >= args['promotion_win_rate']:
+                total_games_per_round = args.get('num_eval_games', 20)
+                eval_args = args.copy()
+                eval_args['num_eval_games'] = total_games_per_round // 2  # 单侧局数
+                eval_args['num_eval_simulations'] = args['num_searches']
+
+                # 准备所有轮次需要的开局状态
+                total_initial_states = prepare_eval_states(trainer.self_play_data,
+                                                           total_games_per_round * len(opponents), args)
+
+                pass_all_checks = True
+                total_wins, total_games = 0, 0
+                state_cursor = 0
+
+                for opp_path in opponents:
+                    # 取出本轮开局
+                    batch_states = total_initial_states[state_cursor: state_cursor + total_games_per_round]
+                    state_cursor += total_games_per_round
+
+                    # 运行评估 (调用C++新接口)
+                    res1 = cpp_mcts_engine.run_parallel_evaluation(opp_path, candidate_path, True, eval_args, 2,
+                                                                   batch_states[:len(batch_states) // 2])
+                    res2 = cpp_mcts_engine.run_parallel_evaluation(opp_path, candidate_path, True, eval_args, 1,
+                                                                   batch_states[len(batch_states) // 2:])
+
+                    wins = res1.get("model2_wins", 0) + res2.get("model2_wins", 0)
+                    losses = res1.get("model1_wins", 0) + res2.get("model1_wins", 0)
+                    draws = res1.get("draws", 0) + res2.get("draws", 0)
+                    round_total = wins + losses + draws
+
+                    if round_total == 0:
+                        round_win_rate = 0
+                    else:
+                        round_win_rate = wins / round_total
+
+                    total_wins += wins
+                    total_games += round_total
+
+                    threshold = args.get('promotion_win_rate', 0.50)
+                    print(f"  vs {opp_path}: 胜率 {round_win_rate:.2%} ({wins}-{losses}-{draws})")
+
+                    if round_win_rate < threshold:
+                        pass_all_checks = False
+
+                avg_win_rate = total_wins / total_games if total_games > 0 else 0
+                print(f"综合胜率: {avg_win_rate:.2%} (Pass All: {pass_all_checks})")
+
+            # 3. 判定晋升
+            threshold = args.get('promotion_win_rate', 0.50)
+            if pass_all_checks and avg_win_rate >= threshold:
                 print(">>> 晋升成功！")
                 current_epoch += 1
                 save_model(model, current_epoch, args)
                 clear_windows_memory()
             else:
                 print(">>> 晋升失败。")
-                model.load_state_dict(torch.load(best_info['path'], map_location=device))
+                # 恢复为当前最好的模型权重，继续训练
+                if best_info:
+                    model.load_state_dict(torch.load(best_info['path'], map_location=device))
 
         except Exception as e:
             print(f"[错误] {e}")

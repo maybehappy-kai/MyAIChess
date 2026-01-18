@@ -58,6 +58,93 @@ def get_move_number_from_state(state, args):
         return -1 # 返回一个错误标识
 
 
+def decode_state_to_game_params(state_flat, args):
+    """将扁平化的状态向量解码为C++ Gomoku构造函数所需的参数"""
+    bs = args['board_size']
+    num_channels = args['num_channels']
+    state_np = np.array(state_flat).reshape(num_channels, bs, bs)
+
+    # 1. 解析元数据
+    hist_steps = args.get('history_steps', 0)
+    meta_idx = (hist_steps + 1) * 4
+
+    # 玩家指示器 (Plane 0 of meta): 全1为黑(1), 全0为白(-1)
+    player_val = state_np[meta_idx, 0, 0]
+    current_player = 1 if player_val > 0.5 else -1
+
+    # 步数 (Plane 1 of meta)
+    # 也可以直接用 get_move_number_from_state，但为了性能这里直接解
+    progress = state_np[meta_idx + 1, 0, 0]
+    max_moves = args['num_rounds'] * 2
+    current_move_number = int(round(progress * max_moves))
+
+    # 2. 解析棋盘平面 (当前时刻 T=0)
+    # Plane 0: Current Player Stones
+    # Plane 1: Opponent Stones
+    # Plane 2: Current Player Territory
+    # Plane 3: Opponent Territory
+    p_stones = state_np[0].flatten()
+    o_stones = state_np[1].flatten()
+    p_terr = state_np[2].flatten()
+    o_terr = state_np[3].flatten()
+
+    # 3. 构建 Bitboards (每方2个uint64)
+    def make_bitboards(flat_grid):
+        b0, b1 = 0, 0
+        for i, val in enumerate(flat_grid):
+            if val > 0.5:
+                if i < 64:
+                    b0 |= (1 << i)
+                else:
+                    b1 |= (1 << (i - 64))
+        return [b0, b1]
+
+    p_s_bits = make_bitboards(p_stones)
+    o_s_bits = make_bitboards(o_stones)
+    p_t_bits = make_bitboards(p_terr)
+    o_t_bits = make_bitboards(o_terr)
+
+    # 根据当前玩家还原绝对黑白方
+    if current_player == 1:  # Current is Black
+        return {
+            "black_stones": p_s_bits, "white_stones": o_s_bits,
+            "black_territory": p_t_bits, "white_territory": o_t_bits,
+            "current_player": 1, "current_move_number": current_move_number
+        }
+    else:  # Current is White
+        return {
+            "black_stones": o_s_bits, "white_stones": p_s_bits,
+            "black_territory": o_t_bits, "white_territory": p_t_bits,
+            "current_player": -1, "current_move_number": current_move_number
+        }
+
+
+def prepare_eval_states(data_pool, num_needed, args):
+    """从数据池中筛选合适的开局状态"""
+    candidates = []
+    # 筛选前10步以内的局面
+    for item in data_pool:
+        # 兼容不同格式 (state, policy, value) 或 (s, p, v, human_player)
+        state = item[0]
+        move_num = get_move_number_from_state(state, args)
+        if 0 <= move_num < 10:
+            candidates.append(state)
+
+    if not candidates:
+        print("[警告] 数据池中没有符合条件的开局(步数<10)，将使用空棋盘。")
+        # 返回空列表，C++会抛出异常，或者我们需要在这里造一个空状态
+        # 为了稳健，我们造一个空开局
+        empty_state = decode_state_to_game_params(np.zeros(len(data_pool[0][0])), args)
+        return [empty_state] * num_needed
+
+    # 随机采样并循环填充
+    selected = []
+    while len(selected) < num_needed:
+        choice = random.choice(candidates)
+        selected.append(decode_state_to_game_params(choice, args))
+    return selected[:num_needed]
+
+
 def clear_windows_memory():
     if platform.system() == "Windows":
         try:
@@ -336,54 +423,92 @@ class Coach:
                                        weight_decay=self.args.get('weight_decay', 0.0001))
                 avg_p_loss, avg_v_loss = self.train(cand_model, optimizer)
                 print(f"  - 训练损失: Policy Loss={avg_p_loss:.4f}, Value Loss={avg_v_loss:.4f}")
-                print("\n步骤3.2: 评估候选模型 vs. 最优模型...")
+                print("\n步骤3.2: 评估候选模型 (车轮战模式)...")
+                # 导出候选模型
                 candidate_model_path_pt = f"candidate_{cand_idx}.pt"
-                cand_model.eval();
+                cand_model.eval()
+                # ... (这里保留原有的 trace 保存代码) ...
                 traced_script_module = torch.jit.trace(cand_model,
                                                        torch.rand(1, self.args['num_channels'], self.args['board_size'],
-                                                                  self.args['board_size']).to(device));
+                                                                  self.args['board_size']).to(device))
                 traced_script_module.save(candidate_model_path_pt)
-                games_per_side = self.args.get('num_eval_games', 20) // 2
-                eval_args = self.args.copy();
-                eval_args['num_eval_games'] = games_per_side;
+
+                # --- 核心改动开始 ---
+                # 1. 寻找对手 (最近的3个模型)
+                import glob
+                # 匹配 model_X.pt (排除 candidate)
+                all_models = sorted([f for f in glob.glob("model_*.pt") if "candidate" not in f],
+                                    key=lambda x: int(re.search(r"model_(\d+)", x).group(1)), reverse=True)
+                opponents = all_models[:3]  # 取最近的3个，例如 [model_10.pt, model_9.pt, model_8.pt]
+                if not opponents: opponents = [best_model_path_pt]  # 兜底
+
+                # 2. 准备开局数据
+                # 总局数 = 对手数 * 每轮局数。这里我们保持每轮评估局数一致
+                games_per_opponent = self.args.get('num_eval_games', 20)
+                total_initial_states = prepare_eval_states(self.self_play_data, games_per_opponent * len(opponents),
+                                                           self.args)
+
+                print(f"  - 准备了 {len(total_initial_states)} 个开局局面 (来自真实数据)")
+                print(f"  - 挑战对手: {opponents}")
+
+                pass_all_checks = True
+                total_wins, total_games_played = 0, 0
+                eval_args = self.args.copy()
+                eval_args['num_eval_games'] = games_per_opponent // 2  # 每一方执黑一半
                 eval_args['num_eval_simulations'] = self.args['num_searches']
-                res1 = cpp_mcts_engine.run_parallel_evaluation(best_model_path_pt, candidate_model_path_pt,
-                                                               device.type == 'cuda', eval_args, mode=2)
-                res2 = cpp_mcts_engine.run_parallel_evaluation(best_model_path_pt, candidate_model_path_pt,
-                                                               device.type == 'cuda', eval_args, mode=1)
-                total_new_wins = res1.get("model2_wins", 0) + res2.get("model2_wins", 0);
-                total_old_wins = res1.get("model1_wins", 0) + res2.get("model1_wins", 0);
-                total_draws = res1.get("draws", 0) + res2.get("draws", 0)
-                total_games = total_new_wins + total_old_wins + total_draws
-                win_rate = total_new_wins / total_games if total_games > 0 else 0
-                print("\n评估总结:")
-                print(
-                    f"  - 新模型执黑时 (新 vs 旧): {res1.get('model2_wins', 0)} 胜 / {res1.get('model1_wins', 0)} 负 / {res1.get('draws', 0)} 平")
-                print(
-                    f"  - 新模型执白时 (旧 vs 新): {res2.get('model2_wins', 0)} 胜 / {res2.get('model1_wins', 0)} 负 / {res2.get('draws', 0)} 平")
-                print(f"  - 综合战绩 (新 vs 旧): {total_new_wins} 胜 / {total_old_wins} 负 / {total_draws} 平")
-                print(f"  - 新模型综合胜率: {win_rate:.2%}")
-                expected_win_rate_candidate = 1 / (1 + 10 ** ((elo_best_model - elo_best_model) / 400));
-                actual_score_candidate = total_new_wins + 0.5 * total_draws;
-                expected_score_candidate = expected_win_rate_candidate * total_games
-                new_elo_candidate = elo_best_model + self.args.get('elo_k_factor', 32) * (
-                            actual_score_candidate - expected_score_candidate)
-                print(f"  - Elo 评级: BestNet ({elo_best_model:.0f}) vs Candidate ({elo_best_model:.0f})");
-                print(
-                    f"  - Elo 变化: Candidate Elo -> {new_elo_candidate:.0f} ({new_elo_candidate - elo_best_model:+.0f})")
+
+                state_cursor = 0
+                for opp_path in opponents:
+                    # 切片取出一组开局供本轮使用
+                    batch_states = total_initial_states[state_cursor: state_cursor + games_per_opponent]
+                    state_cursor += games_per_opponent
+
+                    # 运行评估 (双向)
+                    # Mode 2: Candidate(新) 执黑
+                    res1 = cpp_mcts_engine.run_parallel_evaluation(opp_path, candidate_model_path_pt,
+                                                                   device.type == 'cuda', eval_args, 2,
+                                                                   batch_states[:len(batch_states) // 2])
+                    # Mode 1: Candidate(新) 执白
+                    res2 = cpp_mcts_engine.run_parallel_evaluation(opp_path, candidate_model_path_pt,
+                                                                   device.type == 'cuda', eval_args, 1,
+                                                                   batch_states[len(batch_states) // 2:])
+
+                    # 统计本轮胜率
+                    # model2 是 candidate
+                    wins = res1.get("model2_wins", 0) + res2.get("model2_wins", 0)
+                    losses = res1.get("model1_wins", 0) + res2.get("model1_wins", 0)
+                    draws = res1.get("draws", 0) + res2.get("draws", 0)
+                    round_total = wins + losses + draws
+                    round_win_rate = wins / round_total if round_total > 0 else 0
+
+                    total_wins += wins
+                    total_games_played += round_total
+
+                    # 晋升门槛 (这里硬编码为 0.50，稍后在config中统一)
+                    threshold = self.args.get('promotion_win_rate', 0.50)
+                    print(f"    vs {opp_path}: 胜率 {round_win_rate:.2%} ({wins}-{losses}-{draws}) | 门槛 {threshold}")
+
+                    if round_win_rate < threshold:
+                        pass_all_checks = False
+
+                avg_win_rate = total_wins / total_games_played if total_games_played > 0 else 0
+                print(f"  - 综合平均胜率: {avg_win_rate:.2%}")
+
                 if os.path.exists(candidate_model_path_pt): os.remove(candidate_model_path_pt)
-                if win_rate >= self.args.get('promotion_win_rate', 0.55):
+
+                # 判定: 必须所有轮次达标 且 平均胜率显著 > 门槛
+                if pass_all_checks and avg_win_rate > self.args.get('promotion_win_rate', 0.50):
+                    # ... (这里保留原有的晋升保存逻辑) ...
                     next_model_epoch = current_model_epoch + 1
-                    print(
-                        f"【模型晋升】候选 {cand_idx + 1} 胜率达标，将其保存为 model_{next_model_epoch} 并设为新的最优模型。")
-                    elo_best_model = new_elo_candidate;
-                    self.model.load_state_dict(cand_model.state_dict());
+                    print(f"【模型晋升】候选 {cand_idx + 1} 全面胜出！保存为 model_{next_model_epoch}。")
+                    elo_best_model += 50  # 简单增加Elo
+                    self.model.load_state_dict(cand_model.state_dict())
                     save_model(self.model, next_model_epoch, self.args)
-                    current_model_epoch = next_model_epoch;
-                    promotion_achieved = True;
+                    current_model_epoch = next_model_epoch
+                    promotion_achieved = True
                     break
                 else:
-                    print(f"【模型丢弃】候选 {cand_idx + 1} 胜率未达标。")
+                    print(f"【模型丢弃】未能击败历史模型池。")
             model_was_promoted = promotion_achieved
             if not model_was_promoted: print(f"\n--- 本次尝试未能晋升，将继续尝试击败 model_{current_model_epoch} ---")
             print(f"\n{'=' * 20} 尝试周期 {attempt_num} 总结 {'=' * 20}")

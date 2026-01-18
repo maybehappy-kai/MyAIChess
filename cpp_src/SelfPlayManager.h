@@ -8,6 +8,7 @@
 #include "SafeQueue.h"
 #include "InferenceEngine.h"
 #include <memory>
+#include <cstdint>
 
 extern std::mutex g_io_mutex;
 
@@ -36,6 +37,15 @@ struct MCTS_Config
     float territory_penalty_strength;
 };
 // =================================================================
+
+struct EvalInitialState {
+    uint64_t black_stones[2];
+    uint64_t white_stones[2];
+    uint64_t black_territory[2];
+    uint64_t white_territory[2];
+    int current_player;
+    int current_move_number;
+};
 
 using TrainingDataPacket = std::vector<std::tuple<std::vector<float>, std::vector<float>, double>>;
 
@@ -94,7 +104,8 @@ public:
         std::shared_ptr<InferenceEngine> engine1,
         std::shared_ptr<InferenceEngine> engine2,
         py::dict args,
-        int mode);
+        int mode,
+        py::list initial_states); // <--- 新增参数
     void run();
     py::dict get_results() const;
 
@@ -105,6 +116,7 @@ private:
     std::shared_ptr<InferenceEngine> engine2_;
     std::vector<std::thread> threads_;
     SafeQueue<int> task_queue_;
+    std::vector<EvalInitialState> initial_states_;
 
     // ====================== EvaluationManager 核心修正区域 ======================
     // 同样，将MCTS参数聚合到 MCTS_Config 结构体中
@@ -135,7 +147,8 @@ py::dict run_parallel_evaluation(
     const std::string &model2_path,
     bool use_gpu,
     py::dict args,
-    int mode);
+    int mode,
+    py::list initial_states); // <--- 新增参数
 
 int find_best_action_for_state(
     py::list board_pieces,

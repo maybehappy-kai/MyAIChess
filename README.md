@@ -107,3 +107,32 @@ python arena_ab_vs_mcts.py --games 100 --workers 8
     * `Gomoku.cpp`: 游戏核心逻辑实现（Combo/Beam）。
     * `SelfPlayManager.cpp`: 多线程自对弈管理。
 * `neural_net.py`: PyTorch 神经网络定义（SE-ResNet 架构）。
+
+---
+
+## 💡 Windows 运行优化与故障排除 (Tips)
+
+### 1. 限制 CPU 占用 (防止系统卡死)
+在 Windows 上进行高强度 MCTS 运算时，默认调度可能会占满所有 CPU 逻辑核心，导致鼠标卡顿或系统无响应。建议使用 `start /affinity` 命令来限制 Python 进程使用的核心数量。
+
+*注：`FFFF` 是十六进制掩码，表示仅使用前 16 个逻辑处理器。请根据您的 CPU 核心数酌情调整（例如 8 核 CPU 可尝试 `FE` 以留出一个核心）。*
+
+**单卡模式 (Single GPU):**
+
+    cmd /c "start /affinity FFFF python coach.py"
+
+**双卡模式 (Dual GPU):**
+
+    cmd /c "start /affinity FFFF python worker_train.py"
+    cmd /c "start /affinity FFFF python worker_selfplay.py"
+
+### 2. 指定 GPU 启动人机对战 (防止炸显存)
+在双卡训练进行时，两张显卡可能都有较高负载。为了防止人机对战 GUI 即使在推理时也因显存不足崩溃，建议显式指定使用显存压力相对较小的那张卡（通常是训练卡 GPU 1，因为自对弈卡 GPU 0 显存波动较大）。
+
+**PowerShell (推荐):**
+
+    $env:CUDA_VISIBLE_DEVICES="1"; python play_pixel_art.py
+
+**CMD:**
+
+    set CUDA_VISIBLE_DEVICES=1 && python play_pixel_art.py

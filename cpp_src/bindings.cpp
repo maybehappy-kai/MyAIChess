@@ -23,7 +23,8 @@ PYBIND11_MODULE(cpp_mcts_engine, m)
             py::arg("model2_path"),
             py::arg("use_gpu"),
             py::arg("args"), // <--- 确保这里有正确的括号和结尾
-            py::arg("mode")  // <-- 新增mode参数的绑定
+            py::arg("mode"),
+            py::arg("initial_states") // <--- 新增这一行
       );
 
       // ====================== 在这里新增绑定 ======================
