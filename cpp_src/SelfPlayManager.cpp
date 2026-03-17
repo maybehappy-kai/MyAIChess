@@ -886,11 +886,13 @@ void SelfPlayManager::worker_func(int worker_id)
         {
             std::lock_guard<std::mutex> lock(g_io_mutex);
             std::cerr << "[C++ Worker " << worker_id << ", Game " << game_idx << "] Exception: " << e.what() << std::endl;
+            completed_games_count_++;
         }
         catch (...)
         {
             std::lock_guard<std::mutex> lock(g_io_mutex);
             std::cerr << "[C++ Worker " << worker_id << ", Game " << game_idx << "] Unknown exception occurred!" << std::endl;
+            completed_games_count_++;
         }
     }
 }
@@ -992,6 +994,33 @@ EvaluationManager::EvaluationManager(
         state.current_player = s["current_player"].cast<int>();
         state.current_move_number = s["current_move_number"].cast<int>();
 
+        if (s.contains("history"))
+        {
+            py::list hist = s["history"].cast<py::list>();
+            state.history.reserve(hist.size());
+            for (const auto &h_item : hist)
+            {
+                py::dict h = h_item.cast<py::dict>();
+                std::array<uint64_t, 8> packed{};
+
+                py::list hb = h["black_stones"].cast<py::list>();
+                py::list hw = h["white_stones"].cast<py::list>();
+                py::list hbt = h["black_territory"].cast<py::list>();
+                py::list hwt = h["white_territory"].cast<py::list>();
+
+                packed[0] = hb[0].cast<uint64_t>();
+                packed[1] = hb[1].cast<uint64_t>();
+                packed[2] = hw[0].cast<uint64_t>();
+                packed[3] = hw[1].cast<uint64_t>();
+                packed[4] = hbt[0].cast<uint64_t>();
+                packed[5] = hbt[1].cast<uint64_t>();
+                packed[6] = hwt[0].cast<uint64_t>();
+                packed[7] = hwt[1].cast<uint64_t>();
+
+                state.history.push_back(packed);
+            }
+        }
+
         initial_states_.push_back(state);
     }
 }
@@ -1055,6 +1084,19 @@ void EvaluationManager::worker_func(int worker_id)
                 init_state.white_territory,
                 this->mcts_config_.history_steps);
             std::deque<BitboardState> game_history;
+            for (const auto &packed : init_state.history)
+            {
+                BitboardState hist_state;
+                hist_state.black_stones[0] = packed[0];
+                hist_state.black_stones[1] = packed[1];
+                hist_state.white_stones[0] = packed[2];
+                hist_state.white_stones[1] = packed[3];
+                hist_state.black_territory[0] = packed[4];
+                hist_state.black_territory[1] = packed[5];
+                hist_state.white_territory[0] = packed[6];
+                hist_state.white_territory[1] = packed[7];
+                game_history.push_back(hist_state);
+            }
 
             // vvvvvv 【全新的、更简洁的修正逻辑】 vvvvvv
             std::shared_ptr<InferenceEngine> p1_engine, p2_engine;

@@ -62,33 +62,24 @@ def decode_state_to_game_params(state_flat, args):
     """将扁平化的状态向量解码为C++ Gomoku构造函数所需的参数"""
     bs = args['board_size']
     num_channels = args['num_channels']
-    state_np = np.array(state_flat).reshape(num_channels, bs, bs)
+    state_np = np.array(state_flat, dtype=np.float32).reshape(num_channels, bs, bs)
 
     # 1. 解析元数据
     hist_steps = args.get('history_steps', 0)
     meta_idx = (hist_steps + 1) * 4
 
     # 玩家指示器 (Plane 0 of meta): 全1为黑(1), 全0为白(-1)
-    player_val = state_np[meta_idx, 0, 0]
+    player_val = state_np[meta_idx, 0, 0] if meta_idx < num_channels else 1.0
     current_player = 1 if player_val > 0.5 else -1
 
     # 步数 (Plane 1 of meta)
     # 也可以直接用 get_move_number_from_state，但为了性能这里直接解
-    progress = state_np[meta_idx + 1, 0, 0]
+    progress = state_np[meta_idx + 1, 0, 0] if (meta_idx + 1) < num_channels else 0.0
     max_moves = args['num_rounds'] * 2
     current_move_number = int(round(progress * max_moves))
+    current_move_number = max(0, min(max_moves, current_move_number))
 
-    # 2. 解析棋盘平面 (当前时刻 T=0)
-    # Plane 0: Current Player Stones
-    # Plane 1: Opponent Stones
-    # Plane 2: Current Player Territory
-    # Plane 3: Opponent Territory
-    p_stones = state_np[0].flatten()
-    o_stones = state_np[1].flatten()
-    p_terr = state_np[2].flatten()
-    o_terr = state_np[3].flatten()
-
-    # 3. 构建 Bitboards (每方2个uint64)
+    # 构建 Bitboards (每方2个uint64)
     def make_bitboards(flat_grid):
         b0, b1 = 0, 0
         for i, val in enumerate(flat_grid):
@@ -99,24 +90,48 @@ def decode_state_to_game_params(state_flat, args):
                     b1 |= (1 << (i - 64))
         return [b0, b1]
 
-    p_s_bits = make_bitboards(p_stones)
-    o_s_bits = make_bitboards(o_stones)
-    p_t_bits = make_bitboards(p_terr)
-    o_t_bits = make_bitboards(o_terr)
+    def decode_relative_planes(channel_offset):
+        p_stones = state_np[channel_offset + 0].flatten()
+        o_stones = state_np[channel_offset + 1].flatten()
+        p_terr = state_np[channel_offset + 2].flatten()
+        o_terr = state_np[channel_offset + 3].flatten()
 
-    # 根据当前玩家还原绝对黑白方
-    if current_player == 1:  # Current is Black
+        p_s_bits = make_bitboards(p_stones)
+        o_s_bits = make_bitboards(o_stones)
+        p_t_bits = make_bitboards(p_terr)
+        o_t_bits = make_bitboards(o_terr)
+
+        if current_player == 1:  # Current is Black
+            return {
+                "black_stones": p_s_bits,
+                "white_stones": o_s_bits,
+                "black_territory": p_t_bits,
+                "white_territory": o_t_bits,
+            }
+        # Current is White
         return {
-            "black_stones": p_s_bits, "white_stones": o_s_bits,
-            "black_territory": p_t_bits, "white_territory": o_t_bits,
-            "current_player": 1, "current_move_number": current_move_number
+            "black_stones": o_s_bits,
+            "white_stones": p_s_bits,
+            "black_territory": o_t_bits,
+            "white_territory": p_t_bits,
         }
-    else:  # Current is White
-        return {
-            "black_stones": o_s_bits, "white_stones": p_s_bits,
-            "black_territory": o_t_bits, "white_territory": p_t_bits,
-            "current_player": -1, "current_move_number": current_move_number
-        }
+
+    # 2. 当前状态
+    decoded = decode_relative_planes(0)
+
+    # 3. 恢复历史状态 (T-1, T-2, ...)，供评估起始局面复原使用
+    history_list = []
+    available_history = min(hist_steps, current_move_number)
+    for t in range(1, available_history + 1):
+        channel_offset = t * 4
+        if channel_offset + 3 >= meta_idx:
+            break
+        history_list.append(decode_relative_planes(channel_offset))
+
+    decoded["current_player"] = current_player
+    decoded["current_move_number"] = current_move_number
+    decoded["history"] = history_list
+    return decoded
 
 
 def prepare_eval_states(data_pool, num_needed, args):
@@ -133,9 +148,12 @@ def prepare_eval_states(data_pool, num_needed, args):
     if not candidates:
         print("[警告] 数据池中没有符合条件的开局(步数<10)，将使用空棋盘。")
         # 不能依赖 data_pool[0]，因为 data_pool 可能为空。
-        # 直接按配置构造一个全零空状态。
-        state_len = args['num_channels'] * args['board_size'] * args['board_size']
-        empty_state = decode_state_to_game_params(np.zeros(state_len, dtype=np.float32), args)
+        # 直接按配置构造一个空状态，并显式标记黑棋先手。
+        empty_state_np = np.zeros((args['num_channels'], args['board_size'], args['board_size']), dtype=np.float32)
+        meta_idx = (args.get('history_steps', 0) + 1) * 4
+        if meta_idx < args['num_channels']:
+            empty_state_np[meta_idx].fill(1.0)
+        empty_state = decode_state_to_game_params(empty_state_np.flatten(), args)
         return [empty_state] * num_needed
 
     # 随机采样并循环填充

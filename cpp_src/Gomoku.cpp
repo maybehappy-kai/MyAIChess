@@ -310,16 +310,15 @@ std::vector<float> Gomoku::get_state(const std::deque<BitboardState> &history) c
         if (static_cast<size_t>(t) >= history.size())
             continue;
 
-        // 注意：这里player_at_t的计算逻辑可能需要根据调用者如何构建history进行调整
-        // 假设调用者提供的history[0]是当前状态的前一步(T-1)，history[1]是T-2...
-        // 那么history[t]对应的玩家是 current_player_ * (-1)^(t+1)
-        const int player_at_t = (t % 2 == 0) ? -current_player_ : current_player_;
+        // 历史平面始终保持“当前决策者视角”，
+        // 避免同一语义通道在时序上发生角色翻转。
+        const int reference_player = current_player_;
 
         const BitboardState &historical_state = history[t];
-        const uint64_t *p1_s = (player_at_t == PLAYER_BLACK) ? historical_state.black_stones : historical_state.white_stones;
-        const uint64_t *p2_s = (player_at_t == PLAYER_BLACK) ? historical_state.white_stones : historical_state.black_stones;
-        const uint64_t *p1_t = (player_at_t == PLAYER_BLACK) ? historical_state.black_territory : historical_state.white_territory;
-        const uint64_t *p2_t = (player_at_t == PLAYER_BLACK) ? historical_state.white_territory : historical_state.black_territory;
+        const uint64_t *p1_s = (reference_player == PLAYER_BLACK) ? historical_state.black_stones : historical_state.white_stones;
+        const uint64_t *p2_s = (reference_player == PLAYER_BLACK) ? historical_state.white_stones : historical_state.black_stones;
+        const uint64_t *p1_t = (reference_player == PLAYER_BLACK) ? historical_state.black_territory : historical_state.white_territory;
+        const uint64_t *p2_t = (reference_player == PLAYER_BLACK) ? historical_state.white_territory : historical_state.black_territory;
         const int channel_offset = (t + 1) * 4; // T-1, T-2...从第4个通道开始
         for (int i = 0; i < plane_size; ++i)
         {

@@ -68,13 +68,14 @@ double Node::get_ucb(const Node *child, float c_puct) const
     const double u_value = c_puct * child->prior_ * std::sqrt(parent_total_visits) / (1 + child_total_visits);
 
     // 价值项 Q(s,a)
-    // 将每次虚拟访问视为一次值为-1的“损失”，这是虚拟损失的标准实现方法
+    // 在子节点视角下，虚拟访问按“高价值”计入，
+    // 这样在父节点视角(-Q)会形成惩罚，避免多线程扎堆同一路径。
     double q_value = 0.0;
     if (child_total_visits > 0)
     {
-        // Q = (真实的价值总和 - 虚拟损失次数) / (真实访问次数 + 虚拟损失次数)
+        // Q = (真实价值总和 + 虚拟访问价值) / (真实访问次数 + 虚拟访问次数)
         // 注意：value_sum 已经是对手视角的，所以对于父节点是 -value_sum
-        q_value = (child->value_sum_ - child->virtual_loss_count_) / child_total_visits;
+        q_value = (child->value_sum_ + child->virtual_loss_count_) / child_total_visits;
     }
 
     // 对于父节点来说，子节点的Q值需要取反

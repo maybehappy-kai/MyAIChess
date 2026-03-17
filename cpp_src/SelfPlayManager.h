@@ -9,6 +9,7 @@
 #include "InferenceEngine.h"
 #include <memory>
 #include <cstdint>
+#include <array>
 
 extern std::mutex g_io_mutex;
 
@@ -38,13 +39,15 @@ struct MCTS_Config
 };
 // =================================================================
 
-struct EvalInitialState {
+struct EvalInitialState
+{
     uint64_t black_stones[2];
     uint64_t white_stones[2];
     uint64_t black_territory[2];
     uint64_t white_territory[2];
     int current_player;
     int current_move_number;
+    std::vector<std::array<uint64_t, 8>> history;
 };
 
 using TrainingDataPacket = std::vector<std::tuple<std::vector<float>, std::vector<float>, double>>;

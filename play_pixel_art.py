@@ -36,9 +36,9 @@ class PythonGomoku:
         self.reset()
 
     def get_state_for_training(self):
-        # 此函数用于为训练生成状态，与之前版本保持一致
+        # 为训练构造与C++侧一致的当前状态+元数据平面
         num_channels = args.get('num_channels', 20)
-        state = np.zeros((num_channels, self.board_size, self.board_size))
+        state = np.zeros((num_channels, self.board_size, self.board_size), dtype=np.float32)
         # 视角是相对于当前玩家的，p1是当前玩家，p2是对手
         p1 = self.current_player
         p2 = -self.current_player
@@ -49,7 +49,17 @@ class PythonGomoku:
                 if self.board_territory[r][c] == p1: state[2, r, c] = 1
                 if self.board_territory[r][c] == p2: state[3, r, c] = 1
         # 元数据通道
-        state[num_channels - 4].fill(1 if self.current_player == 1 else 0)
+        history_steps = args.get('history_steps', 0)
+        meta_idx = (history_steps + 1) * 4
+        if meta_idx + 3 < num_channels:
+            state[meta_idx + 0].fill(1 if self.current_player == 1 else 0)
+            progress = self.current_move_number / self.max_total_moves if self.max_total_moves > 0 else 0.0
+            state[meta_idx + 1].fill(progress)
+            if self.last_move is not None:
+                lr, lc = self.last_move
+                state[meta_idx + 2, lr, lc] = 1.0
+            for tr, tc in self.last_territory_delta:
+                state[meta_idx + 3, tr, tc] = 1.0
         return state.flatten().tolist()
 
     def reset(self):
@@ -58,6 +68,7 @@ class PythonGomoku:
         self.current_player = 1  # 黑棋(1)总是先手
         self.current_move_number = 0
         self.last_move = None
+        self.last_territory_delta = set()
 
     def get_valid_moves(self):
         valid_moves = [False] * (self.board_size * self.board_size)
@@ -73,6 +84,7 @@ class PythonGomoku:
         player_who_moved = self.current_player
         self.board_pieces[r][c] = player_who_moved
         self.last_move = (r, c)
+        territory_changed = set()
 
         # ==================== BUG修复区域 ====================
         # line_centers 的逻辑有误，现改为直接返回所有参与三连的棋子坐标
@@ -102,9 +114,13 @@ class PythonGomoku:
                         cr, cc = r, c
                         while 0 <= cr < self.board_size and 0 <= cc < self.board_size:
                             if self.board_pieces[cr][cc] == -player_who_moved: break
+                            if self.board_territory[cr][cc] != player_who_moved:
+                                territory_changed.add((cr, cc))
                             self.board_territory[cr][cc] = player_who_moved
                             cr += sign * dr
                             cc += sign * dc
+
+        self.last_territory_delta = territory_changed
 
         self.current_move_number += 1
         self.current_player *= -1
