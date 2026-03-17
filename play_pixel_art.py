@@ -19,7 +19,7 @@ def find_latest_model_file():
     path = "."
     max_epoch = -1
     latest_file = None
-    pattern = re.compile(r"model_(\d+).*\.pt")
+    pattern = re.compile(r"model_(\d+).*\.pt$")
     for f in os.listdir(path):
         match = pattern.match(f)
         if match:
@@ -293,10 +293,13 @@ class GameGUI:
             else:
                 existing_data = []
             existing_data.extend(final_data)
+            max_size = args.get('expert_data_max_size', 2000)
+            if len(existing_data) > max_size:
+                existing_data = existing_data[-max_size:]
+
             total_human_first_data = sum(1 for (*_, human_side) in existing_data if human_side == 1)
             total_human_second_data = sum(1 for (*_, human_side) in existing_data if human_side == -1)
-            max_size = args.get('expert_data_max_size', 2000)
-            recent_data = existing_data[-max_size:]
+            recent_data = existing_data
             recent_human_first = sum(1 for (*_, human_side) in recent_data if human_side == 1)
             recent_human_second = sum(1 for (*_, human_side) in recent_data if human_side == -1)
             with open(expert_data_file, 'wb') as f:

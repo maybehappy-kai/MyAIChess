@@ -31,7 +31,7 @@ from config import args  # 你的训练/模型超参
 
 def find_latest_model_file() -> str:
     """从当前目录中找最新的 model_xxx.pt 文件"""
-    pattern = re.compile(r"model_(\d+).*\.pt")
+    pattern = re.compile(r"model_(\d+).*\.pt$")
     latest_epoch = -1
     latest_file = None
     for fname in os.listdir("."):
@@ -170,39 +170,30 @@ class AlphaBetaAI:
         for mv in valid_moves:
             tmp = copy.deepcopy(g)
             tmp.execute_move(mv)
-            val = -self._alphabeta(tmp, self.depth - 1, -beta, -alpha, False)
+            val = -self._alphabeta(tmp, self.depth - 1, -beta, -alpha)
             if val > best_val:
                 best_val, best_move = val, mv
             alpha = max(alpha, best_val)
         return best_move
 
-    def _alphabeta(self, g: GameLogic, depth: int, alpha: float, beta: float, is_max: bool) -> float:
+    def _alphabeta(self, g: GameLogic, depth: int, alpha: float, beta: float) -> float:
         _, _, term = g.check_game_end()
         if depth == 0 or term:
             return self.evaluate_board(g)
 
         valid_moves = g.get_valid_moves()
+        if not valid_moves:
+            return self.evaluate_board(g)
 
-        if is_max:
-            val = -math.inf
-            for mv in valid_moves:
-                tmp = copy.deepcopy(g)
-                tmp.execute_move(mv)
-                val = max(val, self._alphabeta(tmp, depth - 1, alpha, beta, False))
-                alpha = max(alpha, val)
-                if alpha >= beta:
-                    break
-            return val
-        else:  # is_min
-            val = math.inf
-            for mv in valid_moves:
-                tmp = copy.deepcopy(g)
-                tmp.execute_move(mv)
-                val = min(val, self._alphabeta(tmp, depth - 1, alpha, beta, True))
-                beta = min(beta, val)
-                if beta <= alpha:
-                    break
-            return val
+        value = -math.inf
+        for mv in valid_moves:
+            tmp = copy.deepcopy(g)
+            tmp.execute_move(mv)
+            value = max(value, -self._alphabeta(tmp, depth - 1, -beta, -alpha))
+            alpha = max(alpha, value)
+            if alpha >= beta:
+                break
+        return value
 
 
 # ==============================================================================

@@ -91,18 +91,21 @@ Gomoku reconstruct_game_state(const Node *target_node, const Gomoku &root_state)
 // =======================================================
 // ===== 带缓存功能的状态获取函数（双竞技场最终版） =====
 // =======================================================
-const Gomoku& get_or_reconstruct_state(
-    const Node* target_node,
-    const Gomoku& root_state,
-    TrivialArena& gomoku_arena // <-- 接收竞技场
-) {
+const Gomoku &get_or_reconstruct_state(
+    const Node *target_node,
+    const Gomoku &root_state,
+    TrivialArena &gomoku_arena // <-- 接收竞技场
+)
+{
     // 1. 缓存命中，直接返回 (逻辑不变)
-    if (target_node->cached_state_) {
+    if (target_node->cached_state_)
+    {
         return *target_node->cached_state_;
     }
 
     // 2. 如果是根节点，使用 gomoku_arena 创建缓存
-    if (target_node->parent_ == nullptr) {
+    if (target_node->parent_ == nullptr)
+    {
         // vvvvvv 【核心修改】 vvvvvv
         // 使用 placement new 在竞技场上构造 Gomoku 对象
         target_node->cached_state_ = new (gomoku_arena.allocate<Gomoku>()) Gomoku(root_state);
@@ -112,12 +115,12 @@ const Gomoku& get_or_reconstruct_state(
 
     // 3. 缓存未命中，递归调用，并传入竞技场
     // vvvvvv 【核心修改】 vvvvvv
-    const Gomoku& parent_state = get_or_reconstruct_state(target_node->parent_, root_state, gomoku_arena);
+    const Gomoku &parent_state = get_or_reconstruct_state(target_node->parent_, root_state, gomoku_arena);
     // ^^^^^^ 【核心修改】 ^^^^^^
 
     // 4. 使用 gomoku_arena 创建子节点的状态缓存
     // vvvvvv 【核心修改】 vvvvvv
-    Gomoku* new_state = new (gomoku_arena.allocate<Gomoku>()) Gomoku(parent_state);
+    Gomoku *new_state = new (gomoku_arena.allocate<Gomoku>()) Gomoku(parent_state);
     new_state->execute_move(target_node->action_taken_);
     target_node->cached_state_ = new_state;
     // ^^^^^^ 【核心修改】 ^^^^^^
@@ -392,7 +395,7 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
             }
 
             // 检查叶子节点是否是终局状态
-            const Gomoku& current_node_state = get_or_reconstruct_state(node, root_state, gomoku_arena);
+            const Gomoku &current_node_state = get_or_reconstruct_state(node, root_state, gomoku_arena);
             auto [end_value, is_terminal] = current_node_state.get_game_ended();
 
             if (is_terminal)
@@ -416,14 +419,12 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
         state_batch.reserve(leaves_batch.size());
         for (const auto *leaf : leaves_batch)
         {
-            const Gomoku& leaf_state = get_or_reconstruct_state(leaf, root_state, gomoku_arena);
+            const Gomoku &leaf_state = get_or_reconstruct_state(leaf, root_state, gomoku_arena);
             std::deque<BitboardState> leaf_history = gather_history_for_leaf(
                 leaf, root_state, history, config.history_steps);
             state_batch.push_back(leaf_state.get_state(leaf_history));
         }
         auto [policy_batch, value_batch] = engine.infer(state_batch, root_state.get_board_size(), config.num_channels);
-
-
 
         // ================== 1c. 扩展和反向传播 (结构优化版) ==================
         for (size_t k = 0; k < leaves_batch.size(); ++k)
@@ -433,7 +434,7 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
             // 【必须保留】从批处理结果中获取神经网络的价值预测
             double nn_value = static_cast<double>(value_batch[k]);
             // 【应用修改】使用新的、带缓存的函数获取状态
-            const Gomoku& leaf_state_for_expansion = get_or_reconstruct_state(leaf, root_state, gomoku_arena);
+            const Gomoku &leaf_state_for_expansion = get_or_reconstruct_state(leaf, root_state, gomoku_arena);
 
             // ... 后续的启发式策略、扩展和反向传播逻辑 ...
             // --- 根节点专属逻辑区 ---
@@ -499,8 +500,6 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
                     apply_ineffective_connection_penalty(current_policy, leaf_state_for_expansion, config.ineffective_connection_penalty_factor);
                 }
             }
-
-
 
             // --- 通用逻辑区 ---
             // 以下逻辑对所有叶子节点（包括根节点）生效
@@ -654,12 +653,11 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
     }
     // --- 修正结束 ---
     double mcts_value = 0.0;
-    if (root->visit_count_ > 0) {
+    if (root->visit_count_ > 0)
+    {
         // root是Node*类型，指向MCTS的根节点
         mcts_value = root->value_sum_ / root->visit_count_;
     }
-
-
 
     return {action, action_probs, mcts_value};
 }
@@ -833,7 +831,7 @@ void SelfPlayManager::worker_func(int worker_id)
             TrivialArena gomoku_arena(32 * 1024 * 1024); // 32MB 给 Gomoku 缓存
             Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
             std::deque<BitboardState> game_history;
-            std::vector<std::tuple<std::vector<float>, std::vector<float>, double>> episode_data;
+            std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
 
             // 【已加回】根据您的反馈，保留 action_size 的初始化
             const int action_size = game.get_board_size() * game.get_board_size();
@@ -847,19 +845,11 @@ void SelfPlayManager::worker_func(int worker_id)
                     // 如果结束，整理并提交本局所有数据，然后跳出循环
                     TrainingDataPacket cpp_training_examples;
                     cpp_training_examples.reserve(episode_data.size());
-                    int current_player_at_end = game.get_current_player();
 
                     for (auto it = episode_data.rbegin(); it != episode_data.rend(); ++it)
                     {
-                        // 新逻辑：直接使用MCTS评估值
-                        // MCTS的价值是从当前玩家视角看的，所以轮到谁，价值就是谁的
-                        // 价值的符号在反向传播时已经处理好，这里直接使用即可
-                        double final_z = std::get<2>(*it);
-
-                        // 我们需要从后往前遍历，因为mcts_value是针对那个时刻的玩家的。
-                        // 训练时，价值z需要统一为根节点玩家（P1）的视角。
-                        // 在我们的框架中，价值网络总是预测当前玩家的胜率。
-                        // 而我们存储的mcts_value已经是当前玩家的视角，所以无需改变符号。
+                        // 终局值是绝对黑白视角(黑=1, 白=-1)，需转换到样本当前行动方视角。
+                        double final_z = final_value * static_cast<double>(std::get<2>(*it));
 
                         cpp_training_examples.emplace_back(std::get<0>(*it), std::get<1>(*it), final_z);
                     }
@@ -877,11 +867,11 @@ void SelfPlayManager::worker_func(int worker_id)
                     this->mcts_config_,
                     MCTS_MODE::SELF_PLAY,
                     node_arena,
-                    gomoku_arena
-                );
+                    gomoku_arena);
+                (void)mcts_value;
 
                 // 3. 存储【有效】的训练数据
-                episode_data.emplace_back(root_state.get_state(game_history), action_probs, mcts_value);
+                episode_data.emplace_back(root_state.get_state(game_history), action_probs, root_state.get_current_player());
 
                 // 4. 更新历史记录并执行动作
                 game_history.push_front(game.get_bitboard_state());
@@ -972,12 +962,14 @@ EvaluationManager::EvaluationManager(
     this->scores_[0] = 0;  // 为"平局"初始化
 
     // 3. 【新增】解析 Python 传来的开局状态列表
-    if (initial_states.size() == 0) {
+    if (initial_states.size() == 0)
+    {
         throw std::runtime_error("EvaluationManager received empty initial_states list!");
     }
 
     initial_states_.reserve(initial_states.size());
-    for (const auto& item : initial_states) {
+    for (const auto &item : initial_states)
+    {
         py::dict s = item.cast<py::dict>();
         EvalInitialState state;
 
@@ -1049,7 +1041,7 @@ void EvaluationManager::worker_func(int worker_id)
             TrivialArena node_arena(100 * 1024 * 1024);
             TrivialArena gomoku_arena(32 * 1024 * 1024);
             // 从预加载的开局状态中取出一个 (循环使用)
-            const auto& init_state = initial_states_[game_idx % initial_states_.size()];
+            const auto &init_state = initial_states_[game_idx % initial_states_.size()];
 
             // 使用重载构造函数，直接“瞬移”到指定局面
             Gomoku game(
@@ -1061,8 +1053,7 @@ void EvaluationManager::worker_func(int worker_id)
                 init_state.white_stones,
                 init_state.black_territory,
                 init_state.white_territory,
-                this->mcts_config_.history_steps
-            );
+                this->mcts_config_.history_steps);
             std::deque<BitboardState> game_history;
 
             // vvvvvv 【全新的、更简洁的修正逻辑】 vvvvvv
@@ -1088,6 +1079,20 @@ void EvaluationManager::worker_func(int worker_id)
             std::map<int, std::shared_ptr<InferenceEngine>> models = {
                 {1, p1_engine}, {-1, p2_engine}};
 
+            auto record_result = [&](double final_value)
+            {
+                int winner_code = 0; // 0 for draw
+                if (std::abs(final_value) > 0.01)
+                {
+                    int winner_player = static_cast<int>(final_value); // 1 for P1 (black), -1 for P2 (white)
+                    std::shared_ptr<InferenceEngine> winning_engine = (winner_player == 1) ? p1_engine : p2_engine;
+                    winner_code = (winning_engine == engine1_) ? 1 : -1;
+                }
+
+                std::lock_guard<std::mutex> lock(results_mutex_);
+                scores_[winner_code]++;
+            };
+
             while (true)
             {
                 const Gomoku root_state(game);
@@ -1101,12 +1106,15 @@ void EvaluationManager::worker_func(int worker_id)
                     this->mcts_config_,
                     MCTS_MODE::EVALUATION,
                     node_arena,
-                    gomoku_arena
-                );
+                    gomoku_arena);
                 // 在评估中，我们不关心返回的policy，所以可以忽略
 
                 if (action == -1)
+                {
+                    auto [final_value, is_done] = game.get_game_ended();
+                    record_result(is_done ? final_value : 0.001);
                     break;
+                }
 
                 // 更新历史并执行动作
                 game_history.push_front(game.get_bitboard_state());
@@ -1129,38 +1137,7 @@ void EvaluationManager::worker_func(int worker_id)
                 auto [final_value, is_done] = game.get_game_ended();
                 if (is_done)
                 {
-                    int winner_code = 0; // 0 for draw
-                    if (std::abs(final_value) > 0.01)
-                    {
-                        int winner_player = static_cast<int>(final_value); // 1 for P1 (black), -1 for P2 (white)
-
-                        // 判断胜利方的引擎是哪一个
-                        std::shared_ptr<InferenceEngine> winning_engine;
-                        if (winner_player == 1)
-                        {
-                            winning_engine = p1_engine;
-                        }
-                        else
-                        { // winner_player == -1
-                            winning_engine = p2_engine;
-                        }
-
-                        // 无论谁赢，都统一检查胜利的引擎是 model1 还是 model2
-                        if (winning_engine == engine1_)
-                        {
-                            winner_code = 1; // Model 1 (旧模型) 胜利
-                        }
-                        else
-                        {
-                            winner_code = -1; // Model 2 (新模型) 胜利
-                        }
-                    }
-
-                    {
-                        std::lock_guard<std::mutex> lock(results_mutex_);
-                        scores_[winner_code]++;
-                    }
-
+                    record_result(final_value);
                     break;
                 }
             }
@@ -1265,10 +1242,9 @@ int find_best_action_for_state(
         }
     }
 
-    // 【修正】Gomoku的构造函数需要的是 num_rounds，而不是 max_total_moves
-    int num_rounds = max_total_moves / 2;
+    // 恢复状态时第二个参数是 max_total_moves，不能传 num_rounds。
     Gomoku root_state(
-        board_size, num_rounds,
+        board_size, max_total_moves,
         current_player, current_move_number,
         black_s, white_s, black_t, white_t, config.history_steps);
 
@@ -1291,8 +1267,7 @@ int find_best_action_for_state(
             config,
             MCTS_MODE::EVALUATION,
             node_arena,
-            gomoku_arena
-        );
+            gomoku_arena);
         final_action = best_action;
     }
 

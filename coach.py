@@ -132,9 +132,10 @@ def prepare_eval_states(data_pool, num_needed, args):
 
     if not candidates:
         print("[警告] 数据池中没有符合条件的开局(步数<10)，将使用空棋盘。")
-        # 返回空列表，C++会抛出异常，或者我们需要在这里造一个空状态
-        # 为了稳健，我们造一个空开局
-        empty_state = decode_state_to_game_params(np.zeros(len(data_pool[0][0])), args)
+        # 不能依赖 data_pool[0]，因为 data_pool 可能为空。
+        # 直接按配置构造一个全零空状态。
+        state_len = args['num_channels'] * args['board_size'] * args['board_size']
+        empty_state = decode_state_to_game_params(np.zeros(state_len, dtype=np.float32), args)
         return [empty_state] * num_needed
 
     # 随机采样并循环填充

@@ -16,3 +16,4 @@ pygame
 # C++ 扩展编译依赖
 pybind11
 setuptools
+ninja
