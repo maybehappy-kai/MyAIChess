@@ -1,7 +1,14 @@
 # file: worker_selfplay.py
 # 最终完整版：包含 Windows 内存清理、动态模型加载、异常恢复
-import torch
 import os
+
+# --- 配置区域 ---
+SELFPLAY_DEVICE_ID = 0  # 显卡 0
+DATA_BUFFER_DIR = "data_buffer"
+
+os.environ["CUDA_VISIBLE_DEVICES"] = str(SELFPLAY_DEVICE_ID)
+
+import torch
 import time
 import queue
 import pickle
@@ -11,10 +18,6 @@ import platform
 import ctypes
 import cpp_mcts_engine
 from config import args
-
-# --- 配置区域 ---
-SELFPLAY_DEVICE_ID = 0  # 显卡 0
-DATA_BUFFER_DIR = "data_buffer"
 
 
 # ----------------
@@ -50,8 +53,6 @@ def find_latest_model_pt():
 
 
 def main():
-    # 强制只使用第一张显卡
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(SELFPLAY_DEVICE_ID)
     ensure_dir(DATA_BUFFER_DIR)
 
     # >>>>>>>>【新增】核心修复代码 >>>>>>>>
@@ -90,7 +91,7 @@ def main():
             start_time = time.time()
             cpp_mcts_engine.run_parallel_self_play(
                 model_file,
-                True,  # use_gpu
+                torch.cuda.is_available(),
                 data_queue,
                 current_args
             )
@@ -104,11 +105,20 @@ def main():
                     new_data.extend(item.get("data", []))
 
             if len(new_data) > 0:
-                filename = f"batch_{epoch}_{int(time.time())}_{str(uuid.uuid4())[:8]}.pkl"
+                filename = f"batch_{epoch}_{int(time.time())}_{str(uuid.uuid4())[:8]}.ready.pkl"
                 save_path = os.path.join(DATA_BUFFER_DIR, filename)
+                tmp_path = f"{save_path}.tmp"
 
-                with open(save_path, 'wb') as f:
-                    pickle.dump(new_data, f)
+                try:
+                    with open(tmp_path, 'wb') as f:
+                        pickle.dump(new_data, f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    # 同目录原子替换，确保训练端只会看到完整包。
+                    os.replace(tmp_path, save_path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
                 print(f"完成! (+{len(new_data)} samples, {duration:.1f}s)")
             else:
                 print("本轮无数据生成 (可能被异常中断)")

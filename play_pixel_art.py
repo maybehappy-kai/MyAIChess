@@ -12,7 +12,9 @@ import threading
 import copy
 import queue
 import pickle
+import time
 import numpy as np
+from collections import deque
 
 
 def find_latest_model_file():
@@ -32,6 +34,7 @@ class PythonGomoku:
     def __init__(self, board_size=9, num_rounds=25):
         self.board_size = board_size
         self.max_total_moves = num_rounds * 2
+        self.history_steps = int(args.get('history_steps', 0))
         self.last_move = None
         self.reset()
 
@@ -48,8 +51,22 @@ class PythonGomoku:
                 if self.board_pieces[r][c] == p2: state[1, r, c] = 1
                 if self.board_territory[r][c] == p1: state[2, r, c] = 1
                 if self.board_territory[r][c] == p2: state[3, r, c] = 1
+
+        # 历史平面：始终保持当前决策者视角，与C++状态编码一致
+        history_steps = self.history_steps
+        for t in range(min(history_steps, len(self.history_states))):
+            channel_offset = (t + 1) * 4
+            if channel_offset + 3 >= num_channels:
+                break
+            hist_pieces, hist_territory = self.history_states[t]
+            for r in range(self.board_size):
+                for c in range(self.board_size):
+                    if hist_pieces[r][c] == p1: state[channel_offset + 0, r, c] = 1
+                    if hist_pieces[r][c] == p2: state[channel_offset + 1, r, c] = 1
+                    if hist_territory[r][c] == p1: state[channel_offset + 2, r, c] = 1
+                    if hist_territory[r][c] == p2: state[channel_offset + 3, r, c] = 1
+
         # 元数据通道
-        history_steps = args.get('history_steps', 0)
         meta_idx = (history_steps + 1) * 4
         if meta_idx + 3 < num_channels:
             state[meta_idx + 0].fill(1 if self.current_player == 1 else 0)
@@ -69,6 +86,7 @@ class PythonGomoku:
         self.current_move_number = 0
         self.last_move = None
         self.last_territory_delta = set()
+        self.history_states = deque(maxlen=self.history_steps)
 
     def get_valid_moves(self):
         valid_moves = [False] * (self.board_size * self.board_size)
@@ -79,7 +97,16 @@ class PythonGomoku:
         return valid_moves
 
     def execute_move(self, action):
+        action_size = self.board_size * self.board_size
+        if action < 0 or action >= action_size:
+            return False, [], 0
         if not self.get_valid_moves()[action]: return False, [], 0
+
+        # 与C++一致：历史记录保存“落子前”棋盘，用于下一状态的T-1平面
+        snapshot_pieces = [row[:] for row in self.board_pieces]
+        snapshot_territory = [row[:] for row in self.board_territory]
+        self.history_states.appendleft((snapshot_pieces, snapshot_territory))
+
         r, c = action // self.board_size, action % self.board_size
         player_who_moved = self.current_player
         self.board_pieces[r][c] = player_who_moved
@@ -196,6 +223,8 @@ class GameGUI:
                        # =====================================================================
                        }
         self.ai_result_queue, self.ai_is_thinking = queue.Queue(), False
+        self.ai_think_started_at = None
+        self.ai_think_timeout_seconds = float(args.get('gui_ai_think_timeout_seconds', 20.0))
         self.game_history = []
 
         button_width, button_height, button_margin = 180, 60, 20
@@ -285,22 +314,36 @@ class GameGUI:
         exit_text = self.font_small.render("退出程序", True, self.button_text_color)
         self.screen.blit(exit_text, exit_text.get_rect(center=self.exit_button_rect.center))
 
-    def _ai_worker_func(self, board_pieces, board_territory, current_player, current_move_number):
+    def _ai_worker_func(self, board_pieces, board_territory, current_player, current_move_number, history_states):
         ai_args = args.copy()
         ai_args['num_channels'] = (args.get('history_steps', 0) + 1) * 4 + 4
         ai_args['board_size'], ai_args['max_total_moves'] = self.game.board_size, self.game.max_total_moves
-        action = cpp_mcts_engine.find_best_action(board_pieces, board_territory, current_player, current_move_number,
-                                                  self.model_file, self.device.type == 'cuda', ai_args)
-        if self.ai_is_thinking: self.ai_result_queue.put(action)
+        action = -1
+        try:
+            action = cpp_mcts_engine.find_best_action(board_pieces, board_territory, current_player, current_move_number,
+                                                      history_states,
+                                                      self.model_file, self.device.type == 'cuda', ai_args)
+        except Exception as e:
+            print(f"[错误] AI 推理线程异常: {e}")
+        finally:
+            if self.ai_is_thinking:
+                self.ai_result_queue.put(action)
 
     def save_game_data(self, game_result):
         if not self.game_history: return
         final_data = []
-        current_value = game_result
-        for state, policy, _ in reversed(self.game_history):
-            final_data.append((state, policy, current_value, self.human_player))
-            current_value *= -1
-        final_data.reverse()
+        for state, policy, player_to_move in self.game_history:
+            if not np.any(policy):
+                continue
+            if player_to_move in (1, -1):
+                value = game_result * player_to_move
+            else:
+                value = game_result
+            final_data.append((state, policy, value, self.human_player))
+
+        if not final_data:
+            return
+        saved_ok = False
         try:
             expert_data_file = 'human_games.pkl'
             if os.path.exists(expert_data_file):
@@ -313,11 +356,16 @@ class GameGUI:
             if len(existing_data) > max_size:
                 existing_data = existing_data[-max_size:]
 
-            total_human_first_data = sum(1 for (*_, human_side) in existing_data if human_side == 1)
-            total_human_second_data = sum(1 for (*_, human_side) in existing_data if human_side == -1)
+            def get_human_side(sample):
+                if isinstance(sample, (list, tuple)) and len(sample) >= 4 and sample[3] in (1, -1):
+                    return sample[3]
+                return None
+
+            total_human_first_data = sum(1 for sample in existing_data if get_human_side(sample) == 1)
+            total_human_second_data = sum(1 for sample in existing_data if get_human_side(sample) == -1)
             recent_data = existing_data
-            recent_human_first = sum(1 for (*_, human_side) in recent_data if human_side == 1)
-            recent_human_second = sum(1 for (*_, human_side) in recent_data if human_side == -1)
+            recent_human_first = sum(1 for sample in recent_data if get_human_side(sample) == 1)
+            recent_human_second = sum(1 for sample in recent_data if get_human_side(sample) == -1)
             with open(expert_data_file, 'wb') as f:
                 pickle.dump(existing_data, f)
             print("\n" + "=" * 20 + " 数据收集报告 " + "=" * 20)
@@ -328,10 +376,23 @@ class GameGUI:
             print(f"最近 {max_size} 条数据中:")
             print(f"  - 人类先手: {recent_human_first} 条 | 人类后手: {recent_human_second} 条")
             print("=" * 58)
+            saved_ok = True
         except Exception as e:
             print(f"[错误] 保存专家数据失败: {e}")
-        self.game_history.clear()
-        self.game_was_completed = True
+            fallback_file = f"human_games_failed_{int(time.time())}.pkl"
+            try:
+                with open(fallback_file, 'wb') as f:
+                    pickle.dump(final_data, f)
+                print(f"[降级保存] 已写入 {fallback_file}，请后续合并到 human_games.pkl")
+                saved_ok = True
+            except Exception as fallback_e:
+                print(f"[错误] 降级保存也失败: {fallback_e}")
+
+        if saved_ok:
+            self.game_history.clear()
+            self.game_was_completed = True
+        else:
+            self.game_was_completed = False
 
     def reset_game_and_ai_state(self):
         if self.game_was_completed:
@@ -345,6 +406,7 @@ class GameGUI:
         self.combo_highlights = []
 
         self.ai_is_thinking = False
+        self.ai_think_started_at = None
         while not self.ai_result_queue.empty():
             try:
                 self.ai_result_queue.get_nowait()
@@ -393,7 +455,7 @@ class GameGUI:
                                                                   0.03), self.game.board_size ** 2
                                     policy = [alpha / (action_size - 1)] * action_size
                                     policy[action] = 1.0 - alpha
-                                    self.game_history.append((state_before, policy, None))
+                                    self.game_history.append((state_before, policy, self.game.current_player))
 
                                     # ==================== BUG修复区域：捕获正确的combo_pieces ====================
                                     valid, combo_pieces, _ = self.game.execute_move(action)
@@ -409,9 +471,21 @@ class GameGUI:
                 if self.ai_is_thinking:
                     try:
                         ai_action = self.ai_result_queue.get_nowait()
+                        valid_moves = self.game.get_valid_moves()
+                        action_size = self.game.board_size ** 2
+                        if (not isinstance(ai_action, int) or ai_action < 0 or ai_action >= action_size or
+                                not valid_moves[ai_action]):
+                            fallback_moves = [i for i, is_valid in enumerate(valid_moves) if is_valid]
+                            if fallback_moves:
+                                ai_action = random.choice(fallback_moves)
+                            else:
+                                self.ai_is_thinking = False
+                                self.ai_think_started_at = None
+                                continue
+
                         state_before = self.game.get_state_for_training()
                         policy_ph = [0.0] * (self.game.board_size ** 2)
-                        self.game_history.append((state_before, policy_ph, None))
+                        self.game_history.append((state_before, policy_ph, self.game.current_player))
 
                         # ==================== BUG修复区域：捕获正确的combo_pieces ====================
                         valid, combo_pieces, _ = self.game.execute_move(ai_action)
@@ -424,21 +498,62 @@ class GameGUI:
                                    BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
                             self.create_effect(pos, 30, (200, 200, 255), 'burst')
                         self.ai_is_thinking = False
+                        self.ai_think_started_at = None
                     except queue.Empty:
-                        pass
+                        if (self.ai_think_started_at is not None and
+                                (time.time() - self.ai_think_started_at) > self.ai_think_timeout_seconds):
+                            print(f"[警告] AI 思考超时({self.ai_think_timeout_seconds:.1f}s)，本回合回退随机合法着。")
+                            valid_moves = self.game.get_valid_moves()
+                            fallback_moves = [i for i, is_valid in enumerate(valid_moves) if is_valid]
+                            if fallback_moves:
+                                ai_action = random.choice(fallback_moves)
+                                state_before = self.game.get_state_for_training()
+                                policy_ph = [0.0] * (self.game.board_size ** 2)
+                                self.game_history.append((state_before, policy_ph, self.game.current_player))
+                                valid, combo_pieces, _ = self.game.execute_move(ai_action)
+                                self.combo_highlights = combo_pieces
+                                if valid:
+                                    r, c = ai_action // self.game.board_size, ai_action % self.game.board_size
+                                    pos = (BOARD_START_X + c * CELL_SIZE + CELL_SIZE // 2,
+                                           BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
+                                    self.create_effect(pos, 30, (200, 200, 255), 'burst')
+                            self.ai_is_thinking = False
+                            self.ai_think_started_at = None
 
                 p1s, p2s, is_ended = self.game.check_game_end()
                 if is_ended:
                     self.game_state = "GAME_OVER"
-                    result = 0.001 if p1s == p2s else (1.0 if p1s > p2s else -1.0)
+                    result = 0.0 if p1s == p2s else (1.0 if p1s > p2s else -1.0)
                     self.save_game_data(result)
                 else:
                     is_ai_turn = self.game.current_player != self.human_player
                     if is_ai_turn and not self.ai_is_thinking and self.model_file:
                         self.ai_is_thinking = True
+                        self.ai_think_started_at = time.time()
                         t_args = (copy.deepcopy(self.game.board_pieces), copy.deepcopy(self.game.board_territory),
-                                  self.game.current_player, self.game.current_move_number)
+                                  self.game.current_player, self.game.current_move_number,
+                                  copy.deepcopy(list(self.game.history_states)))
                         threading.Thread(target=self._ai_worker_func, args=t_args, daemon=True).start()
+                    elif is_ai_turn and not self.ai_is_thinking and not self.model_file:
+                        valid_moves = self.game.get_valid_moves()
+                        fallback_moves = [i for i, is_valid in enumerate(valid_moves) if is_valid]
+                        if fallback_moves:
+                            ai_action = random.choice(fallback_moves)
+                            state_before = self.game.get_state_for_training()
+                            policy_ph = [0.0] * (self.game.board_size ** 2)
+                            self.game_history.append((state_before, policy_ph, self.game.current_player))
+                            valid, combo_pieces, _ = self.game.execute_move(ai_action)
+                            self.combo_highlights = combo_pieces
+                            if valid:
+                                r, c = ai_action // self.game.board_size, ai_action % self.game.board_size
+                                pos = (BOARD_START_X + c * CELL_SIZE + CELL_SIZE // 2,
+                                       BOARD_START_Y + r * CELL_SIZE + CELL_SIZE // 2)
+                                self.create_effect(pos, 30, (200, 200, 255), 'burst')
+                        else:
+                            self.game_state = "GAME_OVER"
+                            p1s, p2s, _ = self.game.check_game_end()
+                            result = 0.0 if p1s == p2s else (1.0 if p1s > p2s else -1.0)
+                            self.save_game_data(result)
 
             self.screen.fill(self.colors['background'])
             if self.game_state == "CHOOSING_SIDE":

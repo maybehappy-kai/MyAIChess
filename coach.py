@@ -192,6 +192,17 @@ def transfer_weights(new_model, path_to_old_weights):
     return new_model
 
 
+def extract_model_epoch(filename):
+    """从模型文件名中提取 epoch，失败时返回 None。"""
+    match = re.search(r"model_(\d+)", os.path.basename(filename))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
 # --- 在 coach.py 中添加此函数 ---
 def remove_old_models(args, keep_max=3):
     """
@@ -248,22 +259,74 @@ def save_model(model, epoch, args):
     base_filename = f"model_{epoch}_{args['num_res_blocks']}x{args['num_hidden']}_{num_channels}c"
     model_path_pth = f"{base_filename}.pth"
     model_path_pt = f"{base_filename}.pt"
-    torch.save(model.state_dict(), model_path_pth)
-    print(f"模型 {model_path_pth} 已保存。")
-    model.eval()
-    try:
-        traced_script_module = torch.jit.trace(model,
-                                               torch.rand(1, num_channels, args['board_size'], args['board_size']).to(
-                                                   device))
-        traced_script_module.save(model_path_pt)
-        print(f"TorchScript模型 {model_path_pt} 已成功导出。")
-    except Exception as e:
-        print(f"【错误】导出TorchScript模型失败: {e}")
+    tmp_model_path_pth = f"{model_path_pth}.tmp"
+    tmp_model_path_pt = f"{model_path_pt}.tmp"
 
-    # ==================== 新增代码 ====================
-    # 3. 调用清理函数，移除过期的旧权重
+    # 清理上次异常中断遗留的临时文件，避免后续 replace 失败。
+    for tmp_path in (tmp_model_path_pth, tmp_model_path_pt):
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    model.eval()
+    export_ok = False
+
+    model_device = next(model.parameters()).device
+    try:
+        traced_script_module = torch.jit.trace(
+            model,
+            torch.rand(1, num_channels, args['board_size'], args['board_size'], device=model_device)
+        )
+        traced_script_module.save(tmp_model_path_pt)
+        print(f"TorchScript模型临时文件 {tmp_model_path_pt} 已成功导出。")
+        export_ok = True
+    except Exception as e:
+        print(f"【错误】trace 导出TorchScript模型失败: {e}")
+
+    # trace 失败时尝试 script 兜底，避免双卡流水线因缺少 .pt 长时间空转。
+    if not export_ok:
+        original_device = model_device
+        try:
+            model.to(torch.device('cpu'))
+            scripted_module = torch.jit.script(model)
+            scripted_module.save(tmp_model_path_pt)
+            export_ok = True
+            print(f"TorchScript模型临时文件 {tmp_model_path_pt} 已通过 script 兜底导出。")
+        except Exception as fallback_e:
+            print(f"【错误】script 兜底导出也失败: {fallback_e}")
+        finally:
+            model.to(original_device)
+
+    if not export_ok:
+        if os.path.exists(tmp_model_path_pt):
+            try:
+                os.remove(tmp_model_path_pt)
+            except OSError:
+                pass
+        print("[警告] 本次模型导出失败，已跳过旧模型清理以保留回滚能力。")
+        return False
+
+    try:
+        torch.save(model.state_dict(), tmp_model_path_pth)
+        os.replace(tmp_model_path_pt, model_path_pt)
+        os.replace(tmp_model_path_pth, model_path_pth)
+        print(f"TorchScript模型 {model_path_pt} 已发布。")
+        print(f"模型 {model_path_pth} 已发布。")
+    except Exception as publish_e:
+        print(f"【错误】模型发布失败: {publish_e}")
+        for tmp_path in (tmp_model_path_pth, tmp_model_path_pt):
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        return False
+
+    # 仅在本次导出和发布成功时清理旧权重，避免失败时误删可恢复检查点。
     remove_old_models(args, keep_max=3)
-    # ================================================
+    return True
 
 
 def find_latest_model_file():
@@ -343,8 +406,22 @@ class Coach:
         if os.path.exists(self_play_data_file):
             try:
                 with open(self_play_data_file, 'rb') as f:
-                    self.self_play_data.extend(pickle.load(f))
-                print(f"[数据加载] 成功从 '{self_play_data_file}' 加载了 {len(self.self_play_data)} 条自对弈数据。")
+                    loaded_self_play = pickle.load(f)
+
+                expected_state_len = self.args['num_channels'] * self.args['board_size'] * self.args['board_size']
+                expected_policy_len = self.args['board_size'] * self.args['board_size']
+                filtered_self_play = []
+                for item in loaded_self_play:
+                    if not isinstance(item, (list, tuple)) or len(item) < 3:
+                        continue
+                    state, policy, value = item[0], item[1], item[2]
+                    if len(state) != expected_state_len or len(policy) != expected_policy_len:
+                        continue
+                    filtered_self_play.append((state, policy, value))
+
+                self.self_play_data.extend(filtered_self_play)
+                dropped = len(loaded_self_play) - len(filtered_self_play)
+                print(f"[数据加载] 成功从 '{self_play_data_file}' 加载了 {len(filtered_self_play)} 条自对弈数据 (过滤 {dropped} 条无效样本)。")
             except Exception as e:
                 print(f"[警告] 加载 '{self_play_data_file}' 失败: {e}")
         human_data_file = 'human_games.pkl'
@@ -352,14 +429,38 @@ class Coach:
             try:
                 with open(human_data_file, 'rb') as f:
                     expert_data_loaded = pickle.load(f)
+
+                expected_state_len = self.args['num_channels'] * self.args['board_size'] * self.args['board_size']
+                expected_policy_len = self.args['board_size'] * self.args['board_size']
+                filtered_expert_data = []
+                for item in expert_data_loaded:
+                    if not isinstance(item, (list, tuple)) or len(item) < 3:
+                        continue
+                    state, policy = item[0], item[1]
+                    if len(state) != expected_state_len or len(policy) != expected_policy_len:
+                        continue
+                    # 专家池仅保留带策略监督的样本
+                    if not np.any(policy):
+                        continue
+                    filtered_expert_data.append(item)
+
                 self.expert_data.clear();
-                self.expert_data.extend(expert_data_loaded)
-                print(f"[数据加载] 成功从 '{human_data_file}' 加载了 {len(self.expert_data)} 条专家数据。")
+                self.expert_data.extend(filtered_expert_data)
+                dropped = len(expert_data_loaded) - len(filtered_expert_data)
+                print(f"[数据加载] 成功从 '{human_data_file}' 加载了 {len(self.expert_data)} 条专家数据 (过滤 {dropped} 条无效/无标签样本)。")
             except Exception as e:
                 print(f"[警告] 加载 '{human_data_file}' 失败: {e}")
         print(f"\n--- 启动时总数据: {len(self.self_play_data)} (自对弈) + {len(self.expert_data)} (专家) ---\n")
 
         best_model_info = find_latest_model_file()
+        if best_model_info is None:
+            print("[启动修复] 未检测到模型文件，正在自动创建 model_0...")
+            if not save_model(self.model, 0, self.args):
+                raise RuntimeError("Coach.learn 启动失败：自动创建 model_0 失败。")
+            best_model_info = find_latest_model_file()
+            if best_model_info is None:
+                raise RuntimeError("Coach.learn 启动失败：创建 model_0 后仍无法检索到模型文件。")
+
         current_model_epoch = best_model_info['epoch']
 
         # --- 核心修正：恢复此变量的定义 ---
@@ -377,6 +478,12 @@ class Coach:
                 f"\n{'=' * 20} 尝试周期: {attempt_num} | 目标: model_{current_model_epoch + 1} (还需 {promotions_needed} 次晋升) {'=' * 20}")
             best_model_info = find_latest_model_file()
             best_model_path_pt = best_model_info['path'].replace('.pth', '.pt')
+            if not os.path.exists(best_model_path_pt):
+                print(f"[检测] 本轮基线 .pt 缺失: {best_model_path_pt}，正在补导出...")
+                if not save_model(self.model, current_model_epoch, self.args):
+                    raise RuntimeError(f"本轮补导出失败: {best_model_path_pt}")
+                best_model_info = find_latest_model_file()
+                best_model_path_pt = best_model_info['path'].replace('.pth', '.pt')
             cpp_args = self.args.copy()
             if model_was_promoted:
                 print(f"步骤1: 模型刚晋升或首次运行，执行一轮完整的自对弈 ({cpp_args['num_selfPlay_episodes']} 局)...")
@@ -423,8 +530,13 @@ class Coach:
 
                 print(f"  - [调试信息] 被丢弃数据的步数频率统计 (步数: 次数): {sorted_counts}")
             print(f"当前自对弈池大小: {len(self.self_play_data)}, 专家池大小: {len(self.expert_data)}")
-            if len(self.self_play_data) + len(self.expert_data) < self.args['batch_size']:
-                print("警告：总数据不足，跳过本次训练。");
+            total_batch_size = self.args['batch_size']
+            expert_ratio = self.args.get('expert_data_ratio', 0.25)
+            expert_batch_size = int(total_batch_size * expert_ratio) if len(self.expert_data) > 0 else 0
+            expert_batch_size = min(len(self.expert_data), expert_batch_size)
+            required_self_play = total_batch_size - expert_batch_size
+            if len(self.self_play_data) < required_self_play:
+                print(f"警告：自对弈数据不足({len(self.self_play_data)}/{required_self_play})，跳过本次训练。")
                 model_was_promoted = False;
                 continue
 
@@ -446,24 +558,53 @@ class Coach:
                 # 导出候选模型
                 candidate_model_path_pt = f"candidate_{cand_idx}.pt"
                 cand_model.eval()
-                # ... (这里保留原有的 trace 保存代码) ...
-                traced_script_module = torch.jit.trace(cand_model,
-                                                       torch.rand(1, self.args['num_channels'], self.args['board_size'],
-                                                                  self.args['board_size']).to(device))
-                traced_script_module.save(candidate_model_path_pt)
+                candidate_export_ok = False
+                try:
+                    traced_script_module = torch.jit.trace(
+                        cand_model,
+                        torch.rand(1, self.args['num_channels'], self.args['board_size'], self.args['board_size']).to(device)
+                    )
+                    traced_script_module.save(candidate_model_path_pt)
+                    candidate_export_ok = True
+                except Exception as trace_e:
+                    print(f"[警告] 候选模型 trace 导出失败: {trace_e}，尝试 script 兜底...")
+                    original_device = next(cand_model.parameters()).device
+                    try:
+                        cand_model.to(torch.device('cpu'))
+                        scripted_module = torch.jit.script(cand_model)
+                        scripted_module.save(candidate_model_path_pt)
+                        candidate_export_ok = True
+                    except Exception as script_e:
+                        print(f"[错误] 候选模型 script 兜底导出失败: {script_e}，跳过该候选。")
+                    finally:
+                        cand_model.to(original_device)
+
+                if not candidate_export_ok:
+                    continue
 
                 # --- 核心改动开始 ---
                 # 1. 寻找对手 (最近的3个模型)
                 import glob
                 # 匹配 model_X.pt (排除 candidate)
-                all_models = sorted([f for f in glob.glob("model_*.pt") if "candidate" not in f],
-                                    key=lambda x: int(re.search(r"model_(\d+)", x).group(1)), reverse=True)
+                parsed_models = []
+                for model_path in glob.glob("model_*.pt"):
+                    if "candidate" in model_path:
+                        continue
+                    epoch = extract_model_epoch(model_path)
+                    if epoch is None:
+                        print(f"[警告] 跳过无法解析epoch的模型文件: {model_path}")
+                        continue
+                    parsed_models.append((epoch, model_path))
+                parsed_models.sort(key=lambda x: x[0], reverse=True)
+                all_models = [model_path for _, model_path in parsed_models]
                 opponents = all_models[:3]  # 取最近的3个，例如 [model_10.pt, model_9.pt, model_8.pt]
                 if not opponents: opponents = [best_model_path_pt]  # 兜底
 
                 # 2. 准备开局数据
                 # 总局数 = 对手数 * 每轮局数。这里我们保持每轮评估局数一致
-                games_per_opponent = self.args.get('num_eval_games', 20)
+                games_per_opponent = max(2, int(self.args.get('num_eval_games', 20)))
+                if games_per_opponent % 2 != 0:
+                    games_per_opponent += 1
                 total_initial_states = prepare_eval_states(self.self_play_data, games_per_opponent * len(opponents),
                                                            self.args)
 
@@ -516,16 +657,23 @@ class Coach:
                 if os.path.exists(candidate_model_path_pt): os.remove(candidate_model_path_pt)
 
                 # 判定: 必须所有轮次达标 且 平均胜率显著 > 门槛
-                if pass_all_checks and avg_win_rate > self.args.get('promotion_win_rate', 0.50):
+                if pass_all_checks and avg_win_rate >= self.args.get('promotion_win_rate', 0.50):
                     # ... (这里保留原有的晋升保存逻辑) ...
                     next_model_epoch = current_model_epoch + 1
                     print(f"【模型晋升】候选 {cand_idx + 1} 全面胜出！保存为 model_{next_model_epoch}。")
                     elo_best_model += 50  # 简单增加Elo
+                    previous_best_path = best_model_info['path']
                     self.model.load_state_dict(cand_model.state_dict())
-                    save_model(self.model, next_model_epoch, self.args)
-                    current_model_epoch = next_model_epoch
-                    promotion_achieved = True
-                    break
+                    if save_model(self.model, next_model_epoch, self.args):
+                        current_model_epoch = next_model_epoch
+                        promotion_achieved = True
+                        break
+                    print("【错误】晋升模型导出失败，本轮晋升取消。")
+                    try:
+                        self.model.load_state_dict(torch.load(previous_best_path, map_location=device))
+                        print(f"[回滚] 已恢复为晋升前最优模型: {previous_best_path}")
+                    except Exception as rollback_e:
+                        raise RuntimeError(f"晋升失败后回滚也失败: {rollback_e}")
                 else:
                     print(f"【模型丢弃】未能击败历史模型池。")
             model_was_promoted = promotion_achieved
@@ -562,13 +710,18 @@ class Coach:
                       'ineffective_connection_penalty_factor']}
         eval_args['num_eval_games'] = games_per_side;
         eval_args['num_eval_simulations'] = eval_args['num_searches']
+        total_eval_states = prepare_eval_states(self.self_play_data, total_games, self.args)
+        first_half_states = total_eval_states[:games_per_side]
+        second_half_states = total_eval_states[games_per_side:games_per_side * 2]
         print(f"\n[实验一] 新模型执黑，进行 {games_per_side} 局...")
-        results1 = cpp_mcts_engine.run_parallel_evaluation(model1_pt_path, model2_pt_path, use_gpu, eval_args, mode=2)
+        results1 = cpp_mcts_engine.run_parallel_evaluation(model1_pt_path, model2_pt_path, use_gpu, eval_args, 2,
+                                   first_half_states)
         new_as_p1_wins, old_as_p2_wins, draws1 = results1.get("model2_wins", 0), results1.get("model1_wins",
                                                                                               0), results1.get("draws",
                                                                                                                0)
         print(f"\n[实验二] 旧模型执黑，进行 {games_per_side} 局...")
-        results2 = cpp_mcts_engine.run_parallel_evaluation(model1_pt_path, model2_pt_path, use_gpu, eval_args, mode=1)
+        results2 = cpp_mcts_engine.run_parallel_evaluation(model1_pt_path, model2_pt_path, use_gpu, eval_args, 1,
+                                   second_half_states)
         old_as_p1_wins, new_as_p2_wins, draws2 = results2.get("model1_wins", 0), results2.get("model2_wins",
                                                                                               0), results2.get("draws",
                                                                                                                0)
@@ -605,7 +758,8 @@ if __name__ == '__main__':
     if latest_model_info is None:
         print("未找到任何已有模型，将从第 1 轮开始全新训练。");
         print("正在创建并保存初始随机模型 (model_0)...")
-        save_model(current_model, 0, args)
+        if not save_model(current_model, 0, args):
+            raise RuntimeError("初始模型导出失败，无法继续训练。")
     else:
         print(f"找到最新模型: {latest_model_info['path']} (第 {latest_model_info['epoch']} 轮)")
         config_blocks, config_hidden, config_channels = args['num_res_blocks'], args['num_hidden'], args['num_channels']
@@ -616,16 +770,30 @@ if __name__ == '__main__':
             try:
                 current_model.load_state_dict(torch.load(latest_model_info['path'], map_location=device));
                 print("权重加载成功！")
+                latest_pt_path = latest_model_info['path'].replace('.pth', '.pt')
+                if not os.path.exists(latest_pt_path):
+                    print(f"[检测] 缺少对应TorchScript模型: {latest_pt_path}，正在重导出...")
+                    if not save_model(current_model, latest_model_info['epoch'], args):
+                        raise RuntimeError("重导出已有模型的 .pt 失败。")
             except Exception as e:
                 print(f"加载权重失败: {e}，将从随机权重开始。")
+                recovery_epoch = latest_model_info['epoch'] + 1
+                print(f"[入口兜底] 正在导出恢复基线 model_{recovery_epoch} (保留原有 model_{latest_model_info['epoch']})...")
+                if not save_model(current_model, recovery_epoch, args):
+                    raise RuntimeError("入口兜底导出失败：缺少可用 .pt，后续自对弈将无法启动。")
         else:
             print("模型结构与当前配置不一致，将执行自动迁移学习。")
             try:
                 current_model = transfer_weights(current_model, latest_model_info['path'])
                 print("为迁移学习后的新模型创建匹配的 .pt 文件...");
-                save_model(current_model, latest_model_info['epoch'], args)
+                if not save_model(current_model, latest_model_info['epoch'], args):
+                    raise RuntimeError("迁移学习模型导出失败，无法继续训练。")
             except Exception as e:
                 print(f"迁移学习失败: {e}，将从随机权重开始训练新结构模型。")
+                recovery_epoch = latest_model_info['epoch'] + 1
+                print(f"[入口兜底] 迁移失败，正在导出新结构恢复基线 model_{recovery_epoch}...")
+                if not save_model(current_model, recovery_epoch, args):
+                    raise RuntimeError("迁移失败后的恢复模型导出失败，无法继续训练。")
 
     coach = Coach(current_model, args)
     coach.learn()

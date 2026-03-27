@@ -158,6 +158,7 @@ int find_best_action_for_state(
     py::list board_territory,
     int current_player,
     int current_move_number,
+    py::list history_states,
     const std::string &model_path,
     bool use_gpu,
     py::dict args);

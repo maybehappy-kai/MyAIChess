@@ -34,6 +34,7 @@ PYBIND11_MODULE(cpp_mcts_engine, m)
             py::arg("board_territory"),
             py::arg("current_player"),
             py::arg("current_move_number"),
+            py::arg("history_states") = py::list(),
             py::arg("model_path"),
             py::arg("use_gpu"),
             py::arg("args"));

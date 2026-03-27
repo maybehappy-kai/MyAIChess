@@ -15,9 +15,11 @@ import re
 import sys
 import math
 import copy
+import random
 import torch
 import argparse
 import multiprocessing as mp
+from collections import deque
 from tqdm import tqdm
 from typing import Tuple, List
 
@@ -51,9 +53,10 @@ def find_latest_model_file() -> str:
 class GameLogic:
     """纯 Python 的轻量级游戏状态管理器（9x9 夺地简化版）"""
 
-    def __init__(self, board_size: int = 9, num_rounds: int = 25):
+    def __init__(self, board_size: int = 9, num_rounds: int = 25, history_steps: int = 0):
         self.board_size = board_size
         self.max_total_moves = num_rounds * 2
+        self.history_steps = max(0, int(history_steps))
         self.reset()
 
     # ---------- 基础接口 ----------
@@ -62,6 +65,7 @@ class GameLogic:
         self.board_territory = [[0] * self.board_size for _ in range(self.board_size)]
         self.current_player = 1
         self.current_move_number = 0
+        self.history_states = deque(maxlen=self.history_steps)
 
     def get_valid_moves(self) -> List[int]:
         moves = []
@@ -72,8 +76,22 @@ class GameLogic:
         return moves
 
     def execute_move(self, action: int):
+        if not isinstance(action, int):
+            return False
+        action_size = self.board_size * self.board_size
+        if action < 0 or action >= action_size:
+            return False
+        if action not in self.get_valid_moves():
+            return False
+
         r, c = divmod(action, self.board_size)
         player = self.current_player
+
+        if self.history_steps > 0:
+            snapshot_pieces = [row[:] for row in self.board_pieces]
+            snapshot_territory = [row[:] for row in self.board_territory]
+            self.history_states.appendleft((snapshot_pieces, snapshot_territory))
+
         self.board_pieces[r][c] = player
 
         # 三连消除 + 领地更新
@@ -110,6 +128,7 @@ class GameLogic:
 
         self.current_move_number += 1
         self.current_player *= -1
+        return True
 
     def check_game_end(self) -> Tuple[int, int, bool]:
         if (self.current_move_number >= self.max_total_moves) or (not self.get_valid_moves()):
@@ -212,7 +231,8 @@ def run_single_game(index: int,
     执行单局对战。
     返回: "MCTS", "AB", 或 "Draw"
     """
-    game = GameLogic(board_size=board_size, num_rounds=num_rounds)
+    game = GameLogic(board_size=board_size, num_rounds=num_rounds,
+                     history_steps=mcts_args.get('history_steps', 0))
     ab_ai = AlphaBetaAI(board_size=board_size, depth=ab_depth)
 
     while True:
@@ -231,6 +251,7 @@ def run_single_game(index: int,
                 game.board_territory,
                 game.current_player,
                 game.current_move_number,
+                list(game.history_states),
                 mcts_model_file,
                 device_type == "cuda",
                 mcts_args
@@ -238,10 +259,19 @@ def run_single_game(index: int,
         else:
             action = ab_ai.find_best_move(game)
 
-        if action == -1:  # AI未能选择有效动作，说明无棋可走
-            continue  # 让游戏逻辑在下一轮循环中判断结束
+        valid_moves = game.get_valid_moves()
+        if action == -1 or action not in valid_moves:
+            # 兜底：若C++侧异常返回非法动作但局面未结束，回退到随机合法着，避免评估进程卡住。
+            fallback_moves = game.get_valid_moves()
+            if not fallback_moves:
+                continue
+            action = random.choice(fallback_moves)
 
-        game.execute_move(action)
+        if not game.execute_move(action):
+            fallback_moves = game.get_valid_moves()
+            if not fallback_moves:
+                continue
+            game.execute_move(random.choice(fallback_moves))
 
 
 def run_single_game_wrapper(task_args: tuple) -> str:

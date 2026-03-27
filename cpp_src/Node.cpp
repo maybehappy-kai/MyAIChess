@@ -17,8 +17,12 @@ Node::Node(Node *parent, int action_taken, float prior)
 
 Node::~Node()
 {
-    // 不需要做任何事情了！
-    // 所有子节点的内存都由Arena统一管理和释放。
+    // 子节点使用常规堆分配，递归释放整棵子树，避免长跑时泄漏。
+    for (Node *child : children_)
+    {
+        delete child;
+    }
+    children_.clear();
 }
 
 // 检查节点是否已扩展
@@ -61,9 +65,13 @@ double Node::get_ucb(const Node *child, float c_puct) const
 
     // 探索项 U(s,a)
     // 分子中的父节点总“等效”访问次数 N(s)
-    double parent_total_visits = static_cast<double>(this->visit_count_ + this->virtual_loss_count_);
+    const int parent_visits = this->visit_count_.load(std::memory_order_relaxed);
+    const int parent_virtual = this->virtual_loss_count_.load(std::memory_order_relaxed);
+    double parent_total_visits = static_cast<double>(parent_visits + parent_virtual);
     // 分母中的子节点总“等效”访问次数 N(s,a)
-    double child_total_visits = static_cast<double>(child->visit_count_ + child->virtual_loss_count_);
+    const int child_visits = child->visit_count_.load(std::memory_order_relaxed);
+    const int child_virtual = child->virtual_loss_count_.load(std::memory_order_relaxed);
+    double child_total_visits = static_cast<double>(child_visits + child_virtual);
 
     const double u_value = c_puct * child->prior_ * std::sqrt(parent_total_visits) / (1 + child_total_visits);
 
@@ -75,7 +83,8 @@ double Node::get_ucb(const Node *child, float c_puct) const
     {
         // Q = (真实价值总和 + 虚拟访问价值) / (真实访问次数 + 虚拟访问次数)
         // 注意：value_sum 已经是对手视角的，所以对于父节点是 -value_sum
-        q_value = (child->value_sum_ + child->virtual_loss_count_) / child_total_visits;
+        const double child_value_sum = child->value_sum_.load(std::memory_order_relaxed);
+        q_value = (child_value_sum + child_virtual) / child_total_visits;
     }
 
     // 对于父节点来说，子节点的Q值需要取反
@@ -123,11 +132,18 @@ void Node::backpropagate(double value)
 {
     // vvvvvv 【核心修改】 vvvvvv
     // 在反向传播时，一个“虚拟损失”被一次“真实访问”所替代
-    this->virtual_loss_count_--; // 偿还（撤销）一次虚拟损失
+    this->virtual_loss_count_.fetch_sub(1, std::memory_order_relaxed); // 偿还（撤销）一次虚拟损失
     // ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-    this->visit_count_++; // 增加一次真实访问
-    this->value_sum_ += value;
+    this->visit_count_.fetch_add(1, std::memory_order_relaxed); // 增加一次真实访问
+
+    // C++17 下 atomic<double> 无 fetch_add，使用 CAS 循环累加。
+    double expected = this->value_sum_.load(std::memory_order_relaxed);
+    while (!this->value_sum_.compare_exchange_weak(expected, expected + value,
+                                                   std::memory_order_relaxed,
+                                                   std::memory_order_relaxed))
+    {
+    }
 
     if (parent_ != nullptr)
     {

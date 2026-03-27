@@ -2,12 +2,12 @@
 
 args = {
     'C': 2,
-    'num_searches': 800,
+    'num_searches': 600,
     'num_iterations': 1,
-    'num_selfPlay_episodes': 100,
-    'num_cpu_threads': 16,
+    'num_selfPlay_episodes': 64,
+    'num_cpu_threads': 15,
     'training_steps_per_iteration': 1000,
-    'batch_size': 256,
+    'batch_size': 512,
     'data_max_size': 200000,
     'num_res_blocks': 9,
     'num_hidden': 128,

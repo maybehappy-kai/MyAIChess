@@ -17,7 +17,6 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
     InferenceEngine &engine,
     const MCTS_Config &config,
     MCTS_MODE mode,
-    TrivialArena &node_arena,
     TrivialArena &gomoku_arena);
 #include <iostream>
 #include <string>
@@ -47,12 +46,13 @@ static std::map<std::string, std::shared_ptr<InferenceEngine>> g_engines;
 std::shared_ptr<InferenceEngine> get_cached_engine(const std::string &model_path, bool use_gpu)
 {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
-    if (g_engines.find(model_path) == g_engines.end())
+    const std::string cache_key = model_path + (use_gpu ? "|gpu" : "|cpu");
+    if (g_engines.find(cache_key) == g_engines.end())
     {
-        std::cout << "[C++ Engine Cache] Caching new model for interactive play: " << model_path << std::endl;
-        g_engines[model_path] = std::make_shared<InferenceEngine>(model_path, use_gpu);
+        std::cout << "[C++ Engine Cache] Caching new model for interactive play: " << cache_key << std::endl;
+        g_engines[cache_key] = std::make_shared<InferenceEngine>(model_path, use_gpu);
     }
-    return g_engines[model_path];
+    return g_engines[cache_key];
 }
 // ==============================================================================
 /*
@@ -177,6 +177,21 @@ std::deque<BitboardState> gather_history_for_leaf(
 std::mutex g_io_mutex;
 std::atomic<long long> g_request_id_counter(0);
 std::atomic<long long> g_arena_full_count(0);
+
+namespace
+{
+    int sanitize_positive_int(int value, int fallback, const char *name)
+    {
+        if (value > 0)
+        {
+            return value;
+        }
+        std::lock_guard<std::mutex> lock(g_io_mutex);
+        std::cerr << "[C++ Config] Invalid " << name << "=" << value
+                  << ", fallback to " << fallback << std::endl;
+        return fallback;
+    }
+}
 
 // ====================== 【新增】狄利克雷噪声辅助函数 ======================
 // 在文件靠前的位置 (例如，在 g_io_mutex 定义后) 添加这个函数
@@ -365,7 +380,6 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
     InferenceEngine &engine,
     const MCTS_Config &config,
     MCTS_MODE mode,
-    TrivialArena &node_arena,  // <-- 新增参数
     TrivialArena &gomoku_arena // <-- 新增参数
 )
 {
@@ -373,8 +387,7 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
     auto root = std::make_unique<Node>(nullptr, -1, 1.0f);
     // Arena arena(128 * 1024 * 1024); // <-- 【重要】删除这一行！竞技场现在由外部传入
 
-    // 在使用前先重置竞技场，确保它们是干净的
-    node_arena.reset();
+    // 在使用前先重置棋局缓存竞技场，确保它是干净的
     gomoku_arena.reset();
     // ...
     // ================== MCTS 主循环 (修正循环结构) ==================
@@ -505,23 +518,72 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
             // 以下逻辑对所有叶子节点（包括根节点）生效
 
             // 步骤 1: 扩展子节点
-            const auto valid_moves = leaf_state_for_expansion.get_valid_moves();
-            for (size_t action = 0; action < current_policy.size(); ++action)
+            // batched MCTS 可能在同一批次多次选中同一个叶子，
+            // 这里必须保证每个节点只扩展一次，避免重复子节点污染树结构。
+            if (leaf->children_.empty())
             {
-                if (current_policy[action] > 0.0f && valid_moves[action])
+                const auto valid_moves = leaf_state_for_expansion.get_valid_moves();
+
+                const size_t action_count = std::min(current_policy.size(), valid_moves.size());
+                float valid_policy_sum = 0.0f;
+                int valid_move_count = 0;
+
+                for (size_t action = 0; action < action_count; ++action)
                 {
-                    try
+                    if (valid_moves[action])
                     {
-                        // vvvvvv 【核心修正】 vvvvvv
-                        // 使用传入的 node_arena 来分配 Node 对象
-                        Node *child_node = new (node_arena.allocate<Node>()) Node(leaf, action, current_policy[action]);
-                        // ^^^^^^ 【核心修正】 ^^^^^^
-                        leaf->children_.push_back(child_node);
+                        ++valid_move_count;
+                        if (current_policy[action] > 0.0f)
+                        {
+                            valid_policy_sum += current_policy[action];
+                        }
                     }
-                    catch (const std::bad_alloc &)
+                    else
                     {
-                        g_arena_full_count++;
-                        break;
+                        current_policy[action] = 0.0f;
+                    }
+                }
+
+                if (valid_move_count > 0)
+                {
+                    if (valid_policy_sum <= 1e-8f)
+                    {
+                        const float uniform_prior = 1.0f / static_cast<float>(valid_move_count);
+                        for (size_t action = 0; action < action_count; ++action)
+                        {
+                            current_policy[action] = valid_moves[action] ? uniform_prior : 0.0f;
+                        }
+                    }
+                    else
+                    {
+                        for (size_t action = 0; action < action_count; ++action)
+                        {
+                            if (valid_moves[action] && current_policy[action] > 0.0f)
+                            {
+                                current_policy[action] /= valid_policy_sum;
+                            }
+                            else
+                            {
+                                current_policy[action] = 0.0f;
+                            }
+                        }
+                    }
+                }
+
+                for (size_t action = 0; action < action_count; ++action)
+                {
+                    if (current_policy[action] > 0.0f && valid_moves[action])
+                    {
+                        try
+                        {
+                            Node *child_node = new Node(leaf, action, current_policy[action]);
+                            leaf->children_.push_back(child_node);
+                        }
+                        catch (const std::bad_alloc &)
+                        {
+                            g_arena_full_count++;
+                            break;
+                        }
                     }
                 }
             }
@@ -551,14 +613,14 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
         for (const auto &child : root->children_)
         {
             if (child)
-                sum_visits += child->visit_count_;
+                sum_visits += static_cast<float>(child->visit_count_.load(std::memory_order_relaxed));
         }
         if (sum_visits > 0)
         {
             for (const auto &child : root->children_)
             {
                 if (child)
-                    action_probs[child->action_taken_] = static_cast<float>(child->visit_count_) / sum_visits;
+                    action_probs[child->action_taken_] = static_cast<float>(child->visit_count_.load(std::memory_order_relaxed)) / sum_visits;
             }
         }
     }
@@ -581,7 +643,7 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
         {
             if (child)
             {
-                powered_visits.push_back(std::pow(static_cast<double>(child->visit_count_), 1.0 / temperature));
+                powered_visits.push_back(std::pow(static_cast<double>(child->visit_count_.load(std::memory_order_relaxed)), 1.0 / temperature));
                 actions.push_back(child->action_taken_);
             }
         }
@@ -599,13 +661,13 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
         std::vector<int> best_actions;
         for (const auto &child : root->children_)
         {
-            if (child && child->visit_count_ > max_visits)
+            if (child && child->visit_count_.load(std::memory_order_relaxed) > max_visits)
             {
-                max_visits = child->visit_count_;
+                max_visits = child->visit_count_.load(std::memory_order_relaxed);
                 best_actions.clear();
                 best_actions.push_back(child->action_taken_);
             }
-            else if (child && child->visit_count_ == max_visits)
+            else if (child && child->visit_count_.load(std::memory_order_relaxed) == max_visits)
             {
                 best_actions.push_back(child->action_taken_);
             }
@@ -651,12 +713,18 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
             p /= final_policy_sum;
         }
     }
+    else if (action >= 0 && action < static_cast<int>(action_probs.size()))
+    {
+        // 极端情况下（例如无子节点或访问计数异常）使用动作一热分布，避免产生全零策略标签。
+        action_probs[action] = 1.0f;
+    }
     // --- 修正结束 ---
     double mcts_value = 0.0;
-    if (root->visit_count_ > 0)
+    const int root_visits = root->visit_count_.load(std::memory_order_relaxed);
+    if (root_visits > 0)
     {
         // root是Node*类型，指向MCTS的根节点
-        mcts_value = root->value_sum_ / root->visit_count_;
+        mcts_value = root->value_sum_.load(std::memory_order_relaxed) / root_visits;
     }
 
     return {action, action_probs, mcts_value};
@@ -686,15 +754,15 @@ SelfPlayManager::SelfPlayManager(std::shared_ptr<InferenceEngine> engine, py::ob
     : engine_(engine), final_data_queue_(final_data_queue)
 {
     this->num_total_games_ = args["num_selfPlay_episodes"].cast<int>();
-    this->num_workers_ = args["num_cpu_threads"].cast<int>();
+    this->num_workers_ = sanitize_positive_int(args["num_cpu_threads"].cast<int>(), 1, "num_cpu_threads");
     this->board_size_ = args["board_size"].cast<int>();
     this->num_rounds_ = args["num_rounds"].cast<int>();
 
     // 直接填充MCTS配置结构体
-    this->mcts_config_.num_simulations = args["num_searches"].cast<int>();
-    this->mcts_config_.mcts_batch_size = args["mcts_batch_size"].cast<int>();
+    this->mcts_config_.num_simulations = sanitize_positive_int(args["num_searches"].cast<int>(), 1, "num_searches");
+    this->mcts_config_.mcts_batch_size = sanitize_positive_int(args["mcts_batch_size"].cast<int>(), 1, "mcts_batch_size");
     this->mcts_config_.c_puct = args["C"].cast<double>();
-    this->mcts_config_.history_steps = args["history_steps"].cast<int>();
+    this->mcts_config_.history_steps = std::max(0, args["history_steps"].cast<int>());
     this->mcts_config_.num_channels = args["num_channels"].cast<int>();
     this->mcts_config_.enable_opening_bias = args["enable_opening_bias"].cast<bool>();
     this->mcts_config_.opening_bias_strength = args["opening_bias_strength"].cast<float>();
@@ -827,14 +895,10 @@ void SelfPlayManager::worker_func(int worker_id)
 
         try
         {
-            TrivialArena node_arena(100 * 1024 * 1024);  // 100MB 给 Node
             TrivialArena gomoku_arena(32 * 1024 * 1024); // 32MB 给 Gomoku 缓存
             Gomoku game(this->board_size_, this->num_rounds_, this->mcts_config_.history_steps);
             std::deque<BitboardState> game_history;
             std::vector<std::tuple<std::vector<float>, std::vector<float>, int>> episode_data;
-
-            // 【已加回】根据您的反馈，保留 action_size 的初始化
-            const int action_size = game.get_board_size() * game.get_board_size();
 
             while (true)
             {
@@ -849,7 +913,9 @@ void SelfPlayManager::worker_func(int worker_id)
                     for (auto it = episode_data.rbegin(); it != episode_data.rend(); ++it)
                     {
                         // 终局值是绝对黑白视角(黑=1, 白=-1)，需转换到样本当前行动方视角。
-                        double final_z = final_value * static_cast<double>(std::get<2>(*it));
+                        // Draw 在引擎内部用极小值区分“已结束”，但训练标签应保持严格中性 0。
+                        const double normalized_final_value = (std::abs(final_value) < 0.01) ? 0.0 : final_value;
+                        double final_z = normalized_final_value * static_cast<double>(std::get<2>(*it));
 
                         cpp_training_examples.emplace_back(std::get<0>(*it), std::get<1>(*it), final_z);
                     }
@@ -866,7 +932,6 @@ void SelfPlayManager::worker_func(int worker_id)
                     *engine_,
                     this->mcts_config_,
                     MCTS_MODE::SELF_PLAY,
-                    node_arena,
                     gomoku_arena);
                 (void)mcts_value;
 
@@ -931,16 +996,16 @@ EvaluationManager::EvaluationManager(
 {
     // 非 MCTS 参数
     this->num_total_games_ = args["num_eval_games"].cast<int>();
-    this->num_workers_ = args["num_cpu_threads"].cast<int>();
+    this->num_workers_ = sanitize_positive_int(args["num_cpu_threads"].cast<int>(), 1, "num_cpu_threads");
     this->board_size_ = args["board_size"].cast<int>();
     this->num_rounds_ = args["num_rounds"].cast<int>();
 
     // 直接填充 MCTS 配置结构体
     // 注意：评估使用的是 num_eval_simulations
-    this->mcts_config_.num_simulations = args["num_eval_simulations"].cast<int>();
+    this->mcts_config_.num_simulations = sanitize_positive_int(args["num_eval_simulations"].cast<int>(), 1, "num_eval_simulations");
     this->mcts_config_.c_puct = args["C"].cast<double>();
-    this->mcts_config_.mcts_batch_size = args["mcts_batch_size"].cast<int>();
-    this->mcts_config_.history_steps = args["history_steps"].cast<int>();
+    this->mcts_config_.mcts_batch_size = sanitize_positive_int(args["mcts_batch_size"].cast<int>(), 1, "mcts_batch_size");
+    this->mcts_config_.history_steps = std::max(0, args["history_steps"].cast<int>());
     this->mcts_config_.num_channels = args["num_channels"].cast<int>();
     this->mcts_config_.enable_territory_penalty = args.contains("enable_territory_penalty") ? args["enable_territory_penalty"].cast<bool>() : false;
     this->mcts_config_.territory_penalty_strength = args.contains("territory_penalty_strength") ? args["territory_penalty_strength"].cast<float>() : 0.0f;
@@ -966,62 +1031,69 @@ EvaluationManager::EvaluationManager(
     // 3. 【新增】解析 Python 传来的开局状态列表
     if (initial_states.size() == 0)
     {
-        throw std::runtime_error("EvaluationManager received empty initial_states list!");
+        EvalInitialState fallback{};
+        fallback.current_player = 1;
+        fallback.current_move_number = 0;
+        initial_states_.push_back(fallback);
+        std::lock_guard<std::mutex> lock(g_io_mutex);
+        std::cerr << "[C++ Eval] initial_states is empty, fallback to empty board state." << std::endl;
     }
-
-    initial_states_.reserve(initial_states.size());
-    for (const auto &item : initial_states)
+    else
     {
-        py::dict s = item.cast<py::dict>();
-        EvalInitialState state;
-
-        py::list b_stones = s["black_stones"].cast<py::list>();
-        state.black_stones[0] = b_stones[0].cast<uint64_t>();
-        state.black_stones[1] = b_stones[1].cast<uint64_t>();
-
-        py::list w_stones = s["white_stones"].cast<py::list>();
-        state.white_stones[0] = w_stones[0].cast<uint64_t>();
-        state.white_stones[1] = w_stones[1].cast<uint64_t>();
-
-        py::list b_terr = s["black_territory"].cast<py::list>();
-        state.black_territory[0] = b_terr[0].cast<uint64_t>();
-        state.black_territory[1] = b_terr[1].cast<uint64_t>();
-
-        py::list w_terr = s["white_territory"].cast<py::list>();
-        state.white_territory[0] = w_terr[0].cast<uint64_t>();
-        state.white_territory[1] = w_terr[1].cast<uint64_t>();
-
-        state.current_player = s["current_player"].cast<int>();
-        state.current_move_number = s["current_move_number"].cast<int>();
-
-        if (s.contains("history"))
+        initial_states_.reserve(initial_states.size());
+        for (const auto &item : initial_states)
         {
-            py::list hist = s["history"].cast<py::list>();
-            state.history.reserve(hist.size());
-            for (const auto &h_item : hist)
+            py::dict s = item.cast<py::dict>();
+            EvalInitialState state;
+
+            py::list b_stones = s["black_stones"].cast<py::list>();
+            state.black_stones[0] = b_stones[0].cast<uint64_t>();
+            state.black_stones[1] = b_stones[1].cast<uint64_t>();
+
+            py::list w_stones = s["white_stones"].cast<py::list>();
+            state.white_stones[0] = w_stones[0].cast<uint64_t>();
+            state.white_stones[1] = w_stones[1].cast<uint64_t>();
+
+            py::list b_terr = s["black_territory"].cast<py::list>();
+            state.black_territory[0] = b_terr[0].cast<uint64_t>();
+            state.black_territory[1] = b_terr[1].cast<uint64_t>();
+
+            py::list w_terr = s["white_territory"].cast<py::list>();
+            state.white_territory[0] = w_terr[0].cast<uint64_t>();
+            state.white_territory[1] = w_terr[1].cast<uint64_t>();
+
+            state.current_player = s["current_player"].cast<int>();
+            state.current_move_number = s["current_move_number"].cast<int>();
+
+            if (s.contains("history"))
             {
-                py::dict h = h_item.cast<py::dict>();
-                std::array<uint64_t, 8> packed{};
+                py::list hist = s["history"].cast<py::list>();
+                state.history.reserve(hist.size());
+                for (const auto &h_item : hist)
+                {
+                    py::dict h = h_item.cast<py::dict>();
+                    std::array<uint64_t, 8> packed{};
 
-                py::list hb = h["black_stones"].cast<py::list>();
-                py::list hw = h["white_stones"].cast<py::list>();
-                py::list hbt = h["black_territory"].cast<py::list>();
-                py::list hwt = h["white_territory"].cast<py::list>();
+                    py::list hb = h["black_stones"].cast<py::list>();
+                    py::list hw = h["white_stones"].cast<py::list>();
+                    py::list hbt = h["black_territory"].cast<py::list>();
+                    py::list hwt = h["white_territory"].cast<py::list>();
 
-                packed[0] = hb[0].cast<uint64_t>();
-                packed[1] = hb[1].cast<uint64_t>();
-                packed[2] = hw[0].cast<uint64_t>();
-                packed[3] = hw[1].cast<uint64_t>();
-                packed[4] = hbt[0].cast<uint64_t>();
-                packed[5] = hbt[1].cast<uint64_t>();
-                packed[6] = hwt[0].cast<uint64_t>();
-                packed[7] = hwt[1].cast<uint64_t>();
+                    packed[0] = hb[0].cast<uint64_t>();
+                    packed[1] = hb[1].cast<uint64_t>();
+                    packed[2] = hw[0].cast<uint64_t>();
+                    packed[3] = hw[1].cast<uint64_t>();
+                    packed[4] = hbt[0].cast<uint64_t>();
+                    packed[5] = hbt[1].cast<uint64_t>();
+                    packed[6] = hwt[0].cast<uint64_t>();
+                    packed[7] = hwt[1].cast<uint64_t>();
 
-                state.history.push_back(packed);
+                    state.history.push_back(packed);
+                }
             }
-        }
 
-        initial_states_.push_back(state);
+            initial_states_.push_back(state);
+        }
     }
 }
 
@@ -1067,7 +1139,6 @@ void EvaluationManager::worker_func(int worker_id)
         try
         {
             // ... 在 EvaluationManager::worker_func 的 try 块内部 ...
-            TrivialArena node_arena(100 * 1024 * 1024);
             TrivialArena gomoku_arena(32 * 1024 * 1024);
             // 从预加载的开局状态中取出一个 (循环使用)
             const auto &init_state = initial_states_[game_idx % initial_states_.size()];
@@ -1147,7 +1218,6 @@ void EvaluationManager::worker_func(int worker_id)
                     *current_engine,
                     this->mcts_config_,
                     MCTS_MODE::EVALUATION,
-                    node_arena,
                     gomoku_arena);
                 // 在评估中，我们不关心返回的policy，所以可以忽略
 
@@ -1192,6 +1262,9 @@ void EvaluationManager::worker_func(int worker_id)
             std::cerr << "[C++ Eval Worker " << worker_id << ", Game " << game_idx
 
                       << "] Exception: " << e.what() << std::endl;
+
+            std::lock_guard<std::mutex> results_lock(results_mutex_);
+            scores_[0]++;
         }
         catch (...)
         {
@@ -1201,6 +1274,9 @@ void EvaluationManager::worker_func(int worker_id)
             std::cerr << "[C++ Eval Worker " << worker_id << ", Game " << game_idx
 
                       << "] Unknown exception occurred!" << std::endl;
+
+            std::lock_guard<std::mutex> results_lock(results_mutex_);
+            scores_[0]++;
         }
     }
 }
@@ -1213,6 +1289,7 @@ int find_best_action_for_state(
     py::list py_board_territory,
     int current_player,
     int current_move_number,
+    py::list py_history_states,
     const std::string &model_path,
     bool use_gpu,
     py::dict args)
@@ -1222,14 +1299,14 @@ int find_best_action_for_state(
 
     // 2. 从Python传入的args字典，动态创建MCTS_Config结构体
     MCTS_Config config;
-    config.num_simulations = args["num_searches"].cast<int>();
+    config.num_simulations = sanitize_positive_int(args["num_searches"].cast<int>(), 1, "num_searches");
     config.c_puct = args["C"].cast<double>();
-    config.mcts_batch_size = args["mcts_batch_size"].cast<int>();
-    config.history_steps = args["history_steps"].cast<int>();
+    config.mcts_batch_size = sanitize_positive_int(args["mcts_batch_size"].cast<int>(), 1, "mcts_batch_size");
+    config.history_steps = std::max(0, args["history_steps"].cast<int>());
 
     // ====================== 【核心修正】 ======================
     // 修正了通道数的计算逻辑，确保与Python训练时完全一致
-    int history_steps = args["history_steps"].cast<int>();
+    int history_steps = config.history_steps;
     int state_channels = (history_steps + 1) * 4;         // (历史步数 + 当前状态) * 4个平面
     int meta_channels = 4;                                // 4个元数据平面
     config.num_channels = state_channels + meta_channels; // 总通道数，(3+1)*4 + 4 = 20
@@ -1290,10 +1367,113 @@ int find_best_action_for_state(
         current_player, current_move_number,
         black_s, white_s, black_t, white_t, config.history_steps);
 
-    // 为人机对战创建一个空的history deque
+    // 从 Python 传入的历史快照恢复 history (按 T-1, T-2... 的顺序)。
     std::deque<BitboardState> history;
+    if (config.history_steps > 0)
+    {
+        const size_t max_hist = static_cast<size_t>(config.history_steps);
+        for (const auto &h_item : py_history_states)
+        {
+            if (history.size() >= max_hist)
+            {
+                break;
+            }
 
-    TrivialArena node_arena(100 * 1024 * 1024);
+            py::sequence hist_pair;
+            try
+            {
+                hist_pair = h_item.cast<py::sequence>();
+            }
+            catch (...)
+            {
+                continue;
+            }
+            if (hist_pair.size() < 2)
+            {
+                continue;
+            }
+
+            py::list hist_pieces;
+            py::list hist_territory;
+            try
+            {
+                hist_pieces = hist_pair[0].cast<py::list>();
+                hist_territory = hist_pair[1].cast<py::list>();
+            }
+            catch (...)
+            {
+                continue;
+            }
+            if (hist_pieces.size() < board_size || hist_territory.size() < board_size)
+            {
+                continue;
+            }
+
+            BitboardState hist_state = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+            bool hist_state_ok = true;
+            for (int r = 0; r < board_size; ++r)
+            {
+                py::list row_p;
+                py::list row_t;
+                try
+                {
+                    row_p = hist_pieces[r].cast<py::list>();
+                    row_t = hist_territory[r].cast<py::list>();
+                }
+                catch (...)
+                {
+                    hist_state_ok = false;
+                    break;
+                }
+                if (row_p.size() < board_size || row_t.size() < board_size)
+                {
+                    hist_state_ok = false;
+                    break;
+                }
+
+                for (int c = 0; c < board_size; ++c)
+                {
+                    const int pos = r * board_size + c;
+                    const int index = pos / 64;
+                    const uint64_t mask = 1ULL << (pos % 64);
+
+                    int piece = 0;
+                    int territory = 0;
+                    try
+                    {
+                        piece = row_p[c].cast<int>();
+                        territory = row_t[c].cast<int>();
+                    }
+                    catch (...)
+                    {
+                        hist_state_ok = false;
+                        break;
+                    }
+
+                    if (piece == 1)
+                        hist_state.black_stones[index] |= mask;
+                    else if (piece == -1)
+                        hist_state.white_stones[index] |= mask;
+
+                    if (territory == 1)
+                        hist_state.black_territory[index] |= mask;
+                    else if (territory == -1)
+                        hist_state.white_territory[index] |= mask;
+                }
+
+                if (!hist_state_ok)
+                {
+                    break;
+                }
+            }
+
+            if (hist_state_ok)
+            {
+                history.push_back(hist_state);
+            }
+        }
+    }
+
     TrivialArena gomoku_arena(32 * 1024 * 1024);
 
     int final_action = -1;
@@ -1308,7 +1488,6 @@ int find_best_action_for_state(
             *engine,
             config,
             MCTS_MODE::EVALUATION,
-            node_arena,
             gomoku_arena);
         final_action = best_action;
     }

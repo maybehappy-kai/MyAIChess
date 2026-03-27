@@ -44,6 +44,11 @@ Gomoku::Gomoku(
       current_move_number_(current_move_number),
       last_move_action_(-1)
 {
+    if (board_size * board_size > 128)
+    {
+        throw std::invalid_argument("Board size is too large for the bitboard implementation (max 11x11).");
+    }
+
     for (int i = 0; i < 2; ++i)
     {
         this->black_stones_[i] = black_s[i];

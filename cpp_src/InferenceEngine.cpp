@@ -1,6 +1,7 @@
 #include "InferenceEngine.h"
 #include <cmath>     // for std::sqrt
 #include <stdexcept> // for std::runtime_error
+#include <string>
 
 // 构造函数的实现
 InferenceEngine::InferenceEngine(const std::string &model_path, bool use_gpu)
@@ -34,27 +35,47 @@ InferenceEngine::InferenceResult InferenceEngine::infer(const std::vector<std::v
         return {};
     }
 
-    // --- 扁平化数据逻辑不变 ---
-    std::vector<float> flat_batch;
-    size_t total_elements = batch_states.size() * batch_states[0].size();
-    flat_batch.reserve(total_elements);
-    for (const auto &state : batch_states)
+    if (board_size <= 0 || num_channels <= 0)
     {
+        throw std::runtime_error("InferenceEngine::infer received invalid board_size or num_channels.");
+    }
+
+    const size_t expected_state_size =
+        static_cast<size_t>(board_size) *
+        static_cast<size_t>(board_size) *
+        static_cast<size_t>(num_channels);
+    if (expected_state_size == 0)
+    {
+        throw std::runtime_error("InferenceEngine::infer calculated an empty expected state size.");
+    }
+
+    std::vector<float> flat_batch;
+    size_t total_elements = batch_states.size() * expected_state_size;
+    flat_batch.reserve(total_elements);
+    for (size_t i = 0; i < batch_states.size(); ++i)
+    {
+        const auto &state = batch_states[i];
+        if (state.size() != expected_state_size)
+        {
+            throw std::runtime_error(
+                "InferenceEngine::infer state shape mismatch at index " + std::to_string(i) +
+                ": expected " + std::to_string(expected_state_size) +
+                ", got " + std::to_string(state.size()));
+        }
         flat_batch.insert(flat_batch.end(), state.begin(), state.end());
     }
+
     torch::Tensor input_tensor = torch::from_blob(
         flat_batch.data(),
-        {static_cast<long>(batch_states.size()), static_cast<long>(batch_states[0].size())},
+        {static_cast<long>(batch_states.size()), static_cast<long>(expected_state_size)},
         torch::kFloat32);
     input_tensor = input_tensor.clone().to(device_);
-    // --- 扁平化数据逻辑结束 ---
 
     if (device_.is_cuda())
     { // 同样只在GPU上转换
         input_tensor = input_tensor.to(torch::kHalf);
     }
 
-    // 3. 使用传入的参数重塑Tensor，不再有任何硬编码或计算
     input_tensor = input_tensor.view({-1, num_channels, board_size, board_size});
 
     // ... (后续的前向传播、解析结果等代码完全保持不变) ...

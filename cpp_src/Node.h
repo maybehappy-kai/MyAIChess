@@ -36,8 +36,8 @@ public: // 成员变量设为公有，方便C++ MCTS引擎直接访问，与Pyth
     int action_taken_;
     float prior_;
 
-    int visit_count_;
-    double value_sum_;
+    std::atomic<int> visit_count_;
+    std::atomic<double> value_sum_;
 
     std::atomic<int> virtual_loss_count_;
 

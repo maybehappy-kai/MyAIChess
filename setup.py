@@ -17,8 +17,11 @@ optimized_compile_args = [
     '/GL',         # 开启全程序优化 (编译时部分)，即LTO
     '/DNDEBUG',    # 禁用调试性的断言 (assert)
     '/fp:fast',    # 允许更快的浮点数运算
-    '/arch:AVX2',  # <-- 新增：明确启用AVX2指令集以最大化SIMD并行计算
 ]
+
+# AVX2 默认关闭以提升部署兼容性；需要时可设置 MYAICHESS_ENABLE_AVX2=1 开启。
+if os.environ.get('MYAICHESS_ENABLE_AVX2', '0') == '1':
+    optimized_compile_args.append('/arch:AVX2')
 
 ext_modules = [
     torch.utils.cpp_extension.CppExtension(
