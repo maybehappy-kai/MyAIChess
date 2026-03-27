@@ -470,6 +470,8 @@ class Coach:
         print(
             f"训练启动：当前模型轮次 {current_model_epoch}，目标轮次 {target_epoch} (需要 {num_successful_promotions_to_achieve} 次成功晋升)")
 
+        optimizer = optim.Adam(self.model.parameters(), lr=self.args['learning_rate'],
+                               weight_decay=self.args.get('weight_decay', 0.0001))
         attempt_num, elo_best_model, model_was_promoted = 0, 1500, True
         while current_model_epoch < target_epoch:
             attempt_num += 1
@@ -544,40 +546,33 @@ class Coach:
             for cand_idx in range(self.args.get('num_candidates_to_train', 1)):
                 print(
                     f"\n{'--' * 15} 正在尝试第 {cand_idx + 1} / {self.args.get('num_candidates_to_train', 1)} 个候选模型 {'--' * 15}")
-                print("\n步骤3.1: 训练候选模型...")
-                cand_model = ExtendedConnectNet(board_size=self.args['board_size'],
-                                                num_res_blocks=self.args['num_res_blocks'],
-                                                num_hidden=self.args['num_hidden'],
-                                                num_channels=self.args['num_channels']).to(device)
-                cand_model.load_state_dict(self.model.state_dict())
-                optimizer = optim.Adam(cand_model.parameters(), lr=self.args['learning_rate'],
-                                       weight_decay=self.args.get('weight_decay', 0.0001))
-                avg_p_loss, avg_v_loss = self.train(cand_model, optimizer)
+                print("\n步骤3.1: 在主模型上继续训练...")
+                avg_p_loss, avg_v_loss = self.train(self.model, optimizer)
                 print(f"  - 训练损失: Policy Loss={avg_p_loss:.4f}, Value Loss={avg_v_loss:.4f}")
-                print("\n步骤3.2: 评估候选模型 (车轮战模式)...")
+                print("\n步骤3.2: 评估当前主模型 (车轮战模式)...")
                 # 导出候选模型
                 candidate_model_path_pt = f"candidate_{cand_idx}.pt"
-                cand_model.eval()
+                self.model.eval()
                 candidate_export_ok = False
                 try:
                     traced_script_module = torch.jit.trace(
-                        cand_model,
+                        self.model,
                         torch.rand(1, self.args['num_channels'], self.args['board_size'], self.args['board_size']).to(device)
                     )
                     traced_script_module.save(candidate_model_path_pt)
                     candidate_export_ok = True
                 except Exception as trace_e:
                     print(f"[警告] 候选模型 trace 导出失败: {trace_e}，尝试 script 兜底...")
-                    original_device = next(cand_model.parameters()).device
+                    original_device = next(self.model.parameters()).device
                     try:
-                        cand_model.to(torch.device('cpu'))
-                        scripted_module = torch.jit.script(cand_model)
+                        self.model.to(torch.device('cpu'))
+                        scripted_module = torch.jit.script(self.model)
                         scripted_module.save(candidate_model_path_pt)
                         candidate_export_ok = True
                     except Exception as script_e:
                         print(f"[错误] 候选模型 script 兜底导出失败: {script_e}，跳过该候选。")
                     finally:
-                        cand_model.to(original_device)
+                        self.model.to(original_device)
 
                 if not candidate_export_ok:
                     continue
@@ -664,20 +659,15 @@ class Coach:
                     next_model_epoch = current_model_epoch + 1
                     print(f"【模型晋升】候选 {cand_idx + 1} 全面胜出！保存为 model_{next_model_epoch}。")
                     elo_best_model += 50  # 简单增加Elo
-                    previous_best_path = best_model_info['path']
-                    self.model.load_state_dict(cand_model.state_dict())
                     if save_model(self.model, next_model_epoch, self.args):
                         current_model_epoch = next_model_epoch
                         promotion_achieved = True
                         break
                     print("【错误】晋升模型导出失败，本轮晋升取消。")
-                    try:
-                        self.model.load_state_dict(torch.load(previous_best_path, map_location=device))
-                        print(f"[回滚] 已恢复为晋升前最优模型: {previous_best_path}")
-                    except Exception as rollback_e:
-                        raise RuntimeError(f"晋升失败后回滚也失败: {rollback_e}")
+                    print("[持续学习] 权重与优化器状态已保留，将在当前基础上继续训练。")
                 else:
                     print(f"【模型丢弃】未能击败历史模型池。")
+                    print("[持续学习] 权重与优化器状态已保留，将在当前基础上继续训练。")
             model_was_promoted = promotion_achieved
             if not model_was_promoted: print(f"\n--- 本次尝试未能晋升，将继续尝试击败 model_{current_model_epoch} ---")
             print(f"\n{'=' * 20} 尝试周期 {attempt_num} 总结 {'=' * 20}")

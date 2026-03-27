@@ -348,11 +348,7 @@ def main():
                 # 确保有足够的数据用于抽取
                 if len(trainer.self_play_data) < 10:
                     print("数据不足，无法抽取开局，跳过评估。")
-                    if best_info:
-                        model.load_state_dict(torch.load(best_info['path'], map_location=device))
-                        optimizer = optim.Adam(model.parameters(), lr=args['learning_rate'],
-                                               weight_decay=args['weight_decay'])
-                        print("[回滚] 评估前置条件不足，已恢复到当前最优模型并重建优化器。")
+                    print("[持续学习] 权重与优化器状态已保留，将在当前基础上继续训练。")
                     continue
 
                 total_games_per_round = max(2, int(args.get('num_eval_games', 20)))
@@ -415,27 +411,14 @@ def main():
                     clear_windows_memory()
                 else:
                     print("[错误] 晋升模型导出失败，本次晋升已取消。")
-                    if best_info:
-                        model.load_state_dict(torch.load(best_info['path'], map_location=device))
-                        optimizer = optim.Adam(model.parameters(), lr=args['learning_rate'],
-                                               weight_decay=args['weight_decay'])
+                    print("[持续学习] 权重与优化器状态已保留，将在当前基础上继续训练。")
             else:
                 print(">>> 晋升失败。")
-                # 恢复为当前最好的模型权重，继续训练
-                if best_info:
-                    model.load_state_dict(torch.load(best_info['path'], map_location=device))
-                    optimizer = optim.Adam(model.parameters(), lr=args['learning_rate'],
-                                           weight_decay=args['weight_decay'])
-                    print("[回滚] 已恢复模型并重建优化器状态。")
+                print("[持续学习] 权重与优化器状态已保留，将在当前基础上继续训练。")
 
         except Exception as e:
             print(f"[错误] {e}")
-            best_info = find_latest_model_file()
-            if best_info:
-                model.load_state_dict(torch.load(best_info['path'], map_location=device))
-                optimizer = optim.Adam(model.parameters(), lr=args['learning_rate'],
-                                       weight_decay=args['weight_decay'])
-                print("[回滚] 异常后已恢复模型并重建优化器状态。")
+            print("[持续学习] 异常后不回滚，权重与优化器状态已保留，将在当前基础上继续训练。")
 
         finally:
             if os.path.exists(candidate_path):
