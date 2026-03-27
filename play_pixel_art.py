@@ -331,6 +331,15 @@ class GameGUI:
 
     def save_game_data(self, game_result):
         if not self.game_history: return
+
+        # 仅保留“人类严格获胜”对局，避免平局/失败样本污染专家池。
+        human_side = float(self.human_player) if self.human_player in (1, -1) else None
+        if human_side is None or float(game_result) != human_side:
+            print("[数据丢弃] 本局人类未能获胜（平局或失败），为防止污染模型，专家数据已丢弃。")
+            self.game_history.clear()
+            self.game_was_completed = False
+            return
+
         final_data = []
         for state, policy, player_to_move in self.game_history:
             if not np.any(policy):

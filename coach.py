@@ -650,6 +650,8 @@ class Coach:
 
                     if round_win_rate < threshold:
                         pass_all_checks = False
+                        print(f"    -> 未达门槛({threshold:.2f})，提前终止后续对手评估以节省算力。")
+                        break
 
                 avg_win_rate = total_wins / total_games_played if total_games_played > 0 else 0
                 print(f"  - 综合平均胜率: {avg_win_rate:.2%}")
@@ -657,7 +659,7 @@ class Coach:
                 if os.path.exists(candidate_model_path_pt): os.remove(candidate_model_path_pt)
 
                 # 判定: 必须所有轮次达标 且 平均胜率显著 > 门槛
-                if pass_all_checks and avg_win_rate >= self.args.get('promotion_win_rate', 0.50):
+                if pass_all_checks and avg_win_rate > self.args.get('promotion_win_rate', 0.50):
                     # ... (这里保留原有的晋升保存逻辑) ...
                     next_model_epoch = current_model_epoch + 1
                     print(f"【模型晋升】候选 {cand_idx + 1} 全面胜出！保存为 model_{next_model_epoch}。")

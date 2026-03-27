@@ -399,13 +399,15 @@ def main():
 
                     if round_win_rate < threshold:
                         pass_all_checks = False
+                        print(f"  -> 未达门槛({threshold:.2f})，提前终止后续对手评估以节省算力。")
+                        break
 
                 avg_win_rate = total_wins / total_games if total_games > 0 else 0
                 print(f"综合胜率: {avg_win_rate:.2%} (Pass All: {pass_all_checks})")
 
             # 3. 判定晋升
             threshold = args.get('promotion_win_rate', 0.50)
-            if pass_all_checks and avg_win_rate >= threshold:
+            if pass_all_checks and avg_win_rate > threshold:
                 print(">>> 晋升成功！")
                 next_epoch = current_epoch + 1
                 if save_model(model, next_epoch, args):

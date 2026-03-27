@@ -32,7 +32,7 @@ args = {
     'temperature_start': 1.0,
     'temperature_end': 0.1,
     'temperature_decay_moves': 10,
-    'num_eval_games': 20,
+    'num_eval_games': 100,
     'board_size': 9,
     'num_rounds': 25,
     'mcts_batch_size': 256,
