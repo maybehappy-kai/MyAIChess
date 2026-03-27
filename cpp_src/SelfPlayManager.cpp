@@ -389,6 +389,144 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
 
     // 在使用前先重置棋局缓存竞技场，确保它是干净的
     gomoku_arena.reset();
+
+    // ================== 根节点预评估 (Root Node Pre-evaluation) ==================
+    // 先单独推理并扩展根节点，避免第一批次搜索都阻塞在未扩展根节点上。
+    const Gomoku &root_cached_state = get_or_reconstruct_state(root.get(), root_state, gomoku_arena);
+    auto [root_end_value, root_is_terminal] = root_cached_state.get_game_ended();
+    (void)root_end_value;
+
+    if (!root_is_terminal)
+    {
+        std::vector<std::vector<float>> root_state_batch;
+        root_state_batch.reserve(1);
+        root_state_batch.push_back(root_cached_state.get_state(history));
+
+        auto root_infer_result = engine.infer(root_state_batch, root_state.get_board_size(), config.num_channels);
+        if (!root_infer_result.first.empty())
+        {
+            auto root_policy = root_infer_result.first[0];
+
+            // 根节点专属先验修正统一前置到预评估阶段。
+            if (mode == MCTS_MODE::SELF_PLAY)
+            {
+                if (config.enable_opening_bias && root_cached_state.get_move_number() < 50)
+                {
+                    const int board_size = root_cached_state.get_board_size();
+                    float bias_strength = config.opening_bias_strength;
+                    std::vector<float> opening_bias(board_size * board_size, 0.0f);
+                    for (int r = 0; r < board_size; ++r)
+                    {
+                        for (int c = 0; c < board_size; ++c)
+                        {
+                            int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
+                            float bias = 0.0f;
+                            if (dist_from_edge == 0)
+                                bias = 0.1f;
+                            else if (dist_from_edge == 1)
+                                bias = 0.4f;
+                            else if (dist_from_edge == 2)
+                                bias = 0.8f;
+                            else
+                                bias = 1.0f;
+                            opening_bias[r * board_size + c] = bias;
+                        }
+                    }
+
+                    float policy_sum = 0.0f;
+                    for (size_t pol_i = 0; pol_i < root_policy.size(); ++pol_i)
+                    {
+                        root_policy[pol_i] += bias_strength * opening_bias[pol_i];
+                        policy_sum += root_policy[pol_i];
+                    }
+                    if (policy_sum > 0.0f)
+                    {
+                        for (size_t pol_i = 0; pol_i < root_policy.size(); ++pol_i)
+                        {
+                            root_policy[pol_i] /= policy_sum;
+                        }
+                    }
+                }
+
+                add_dirichlet_noise(root_policy, root_cached_state.get_valid_moves(),
+                                    config.dirichlet_alpha, config.dirichlet_epsilon);
+            }
+
+            if (config.enable_territory_penalty)
+            {
+                apply_territory_penalty(root_policy, root_cached_state, config.territory_penalty_strength);
+            }
+
+            if (config.enable_ineffective_connection_penalty)
+            {
+                apply_ineffective_connection_penalty(root_policy, root_cached_state, config.ineffective_connection_penalty_factor);
+            }
+
+            const auto valid_moves = root_cached_state.get_valid_moves();
+            const size_t action_count = std::min(root_policy.size(), valid_moves.size());
+            float valid_policy_sum = 0.0f;
+            int valid_move_count = 0;
+
+            for (size_t action = 0; action < action_count; ++action)
+            {
+                if (valid_moves[action])
+                {
+                    ++valid_move_count;
+                    if (root_policy[action] > 0.0f)
+                    {
+                        valid_policy_sum += root_policy[action];
+                    }
+                }
+                else
+                {
+                    root_policy[action] = 0.0f;
+                }
+            }
+
+            if (valid_move_count > 0)
+            {
+                if (valid_policy_sum <= 1e-8f)
+                {
+                    const float uniform_prior = 1.0f / static_cast<float>(valid_move_count);
+                    for (size_t action = 0; action < action_count; ++action)
+                    {
+                        root_policy[action] = valid_moves[action] ? uniform_prior : 0.0f;
+                    }
+                }
+                else
+                {
+                    for (size_t action = 0; action < action_count; ++action)
+                    {
+                        if (valid_moves[action] && root_policy[action] > 0.0f)
+                        {
+                            root_policy[action] /= valid_policy_sum;
+                        }
+                        else
+                        {
+                            root_policy[action] = 0.0f;
+                        }
+                    }
+                }
+            }
+
+            for (size_t action = 0; action < action_count; ++action)
+            {
+                if (root_policy[action] > 0.0f && valid_moves[action])
+                {
+                    try
+                    {
+                        Node *child_node = new Node(root.get(), static_cast<int>(action), root_policy[action]);
+                        root->children_.push_back(child_node);
+                    }
+                    catch (const std::bad_alloc &)
+                    {
+                        g_arena_full_count++;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     // ...
     // ================== MCTS 主循环 (修正循环结构) ==================
     for (int i = 0; i < config.num_simulations; i += config.mcts_batch_size)
@@ -448,71 +586,6 @@ std::tuple<int, std::vector<float>, double> find_best_action_by_mcts(
             double nn_value = static_cast<double>(value_batch[k]);
             // 【应用修改】使用新的、带缓存的函数获取状态
             const Gomoku &leaf_state_for_expansion = get_or_reconstruct_state(leaf, root_state, gomoku_arena);
-
-            // ... 后续的启发式策略、扩展和反向传播逻辑 ...
-            // --- 根节点专属逻辑区 ---
-            // 所有只在根节点应用的启发式策略都集中于此
-            if (leaf == root.get())
-            {
-                // Part 1: 仅在“训练(自对弈)”模式下生效的探索性策略
-                if (mode == MCTS_MODE::SELF_PLAY)
-                {
-                    // 开局偏置
-                    if (config.enable_opening_bias && leaf_state_for_expansion.get_move_number() < 50)
-                    {
-                        const int board_size = leaf_state_for_expansion.get_board_size();
-                        float bias_strength = config.opening_bias_strength;
-                        std::vector<float> opening_bias(board_size * board_size, 0.0f);
-                        for (int r = 0; r < board_size; ++r)
-                        {
-                            for (int c = 0; c < board_size; ++c)
-                            {
-                                int dist_from_edge = std::min({r, c, board_size - 1 - r, board_size - 1 - c});
-                                float bias = 0.0f;
-                                if (dist_from_edge == 0)
-                                    bias = 0.1f;
-                                else if (dist_from_edge == 1)
-                                    bias = 0.4f;
-                                else if (dist_from_edge == 2)
-                                    bias = 0.8f;
-                                else
-                                    bias = 1.0f;
-                                opening_bias[r * board_size + c] = bias;
-                            }
-                        }
-                        float policy_sum = 0.0f;
-                        for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i)
-                        {
-                            current_policy[pol_i] += bias_strength * opening_bias[pol_i];
-                            policy_sum += current_policy[pol_i];
-                        }
-                        if (policy_sum > 0.0f)
-                        {
-                            for (size_t pol_i = 0; pol_i < current_policy.size(); ++pol_i)
-                            {
-                                current_policy[pol_i] /= policy_sum;
-                            }
-                        }
-                    }
-                    // 狄利克雷噪声
-                    add_dirichlet_noise(current_policy, leaf_state_for_expansion.get_valid_moves(),
-                                        config.dirichlet_alpha, config.dirichlet_epsilon);
-                }
-
-                // Part 2: 在“所有模式”下对根节点生效的策略惩罚
-                // (新位置) 领地维持惩罚
-                if (config.enable_territory_penalty)
-                {
-                    apply_territory_penalty(current_policy, leaf_state_for_expansion, config.territory_penalty_strength);
-                }
-
-                // ★★★ 新增调用点：在这里应用新的惩罚函数 ★★★
-                // 这个位置确保了它在训练、评估、对战时都生效
-                if (config.enable_ineffective_connection_penalty)
-                {
-                    apply_ineffective_connection_penalty(current_policy, leaf_state_for_expansion, config.ineffective_connection_penalty_factor);
-                }
-            }
 
             // --- 通用逻辑区 ---
             // 以下逻辑对所有叶子节点（包括根节点）生效
